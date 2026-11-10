@@ -1,0 +1,25 @@
+# Dependencies (none are required at runtime; keep them out of the repo)
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# Local plugin data / secrets — never commit
+settings.json
+image.log
+.env
+.env.*
+credentials*
+*.credentials.yaml
+
+# Build and pack artifacts
+dist/
+*.tgz
+*.tar.gz
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
+coverage/

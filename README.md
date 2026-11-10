@@ -1,0 +1,141 @@
+# dsh-choerodon-workbench
+
+> DeepSeek Harness 插件：在左侧栏加一个「猪齿鱼任务」入口，按项目查看我的 Choerodon 工单，
+> 面板内预览富文本明细与截图、改状态、发评论，并一键把工单派发给 agent 处理。
+
+这是一个 **DSH Bundle 插件**（Host + 浏览器 Client 两半）：Host 侧用 Node 直接访问猪齿鱼网关，
+Client 侧只负责界面，通过本机 Harness 的受认证接口取数。不依赖任何第三方 npm 包。
+
+---
+
+## 功能
+
+| 能力 | 说明 |
+|---|---|
+| 侧栏入口 | 左侧栏图标 + 独立主面板，不干扰会话页 |
+| 按项目查看 | 关注若干项目后，顶部下拉切换项目，切项目即切列表 |
+| 「只看我」 | 每个项目可配置自己的过滤字段（经办人、或自定义人员字段如「后端技术」），按当前账号过滤 |
+| 分页与搜索 | 每页 20 条（可配），上一页/下一页；按工单号或概要搜索；可切换「只看未完成」 |
+| 明细预览 | 描述按**富文本**渲染（段落/列表/代码/表格/链接），内联显示截图，点击放大预览 |
+| 改状态 | 实时读取状态机可用的流转（随当前状态变化），二次确认后提交，带版本号防并发 |
+| 评论 | 分页查看（富文本渲染）+ 发表；可删除自己的评论 |
+| 派发处理 | 「去处理」选择数据修复 / Bug 排查 / 需求开发，在 `<会话根目录>/<项目 code>` 新建会话并生成 brief 草稿，确认后回车即由 agent 执行 |
+| 图片代理 | 截图经本机代理加载（支持私有桶、带临时令牌的 URL、第三方 CDN），失败时显示明确原因 |
+
+## 环境要求与兼容性
+
+- **DeepSeek Harness 0.2.2-rc.1**（桌面版实测；Web 版应同样可用）。插件依赖的 Slot、Client 服务与
+  `/api` 通道属于 Harness 内部接口，跨大版本升级后可能需要适配。
+- **Node.js ≥ 20**（Host 半使用全局 `fetch`、`AbortSignal.timeout`、`node:crypto`）。
+- 无第三方运行时依赖，`npm install` 不需要拉包。
+- 目标系统：任何可运行 Choerodon（猪齿鱼）并能访问其 API 网关的环境。
+
+## 安装
+
+### 方式一：在 Harness 里安装（推荐）
+
+1. 取得本仓库目录（`git clone` 或下载解压）。
+2. 打开 Harness → **设置 → 插件**，使用「安装 Bundle」并选择该目录（需要绝对路径）。
+3. 确认插件列表里出现 **猪齿鱼任务工作台** 且已启用；侧栏会出现新图标。
+4. 如果图标没出现，刷新页面（Cmd/Ctrl+R）。
+
+### 方式二：命令行（dsh CLI）
+
+```bash
+git clone https://github.com/nichuan/dsh-choerodon-workbench.git
+
+# 把包安装进目标 profile（desktop 换成你的 profile 名）
+# 带 dsh.bundle 声明的包会自动加入该 profile 的 bundle 列表
+dsh plugin --profile desktop add "$PWD/dsh-choerodon-workbench"
+```
+
+重启 Harness 生效。也可以先 `npm pack`，再
+`dsh plugin --profile desktop add ./dsh-choerodon-workbench-1.0.0.tgz`。
+
+> 若插件列表里没有自动出现，检查 `~/.dsh/profiles/<profile>/package.json` 的
+> `dsh.profile.bundles` 是否包含 `dsh-choerodon-workbench`，补上后重启即可。
+
+> 注意：本插件不修改你的 profile 配置，所有个人配置写在
+> `~/.dsh/choerodon-workbench/settings.json`。
+
+## 首次配置
+
+打开 **设置 → 猪齿鱼**，填写：
+
+| 字段 | 说明 |
+|---|---|
+| 网关地址 | 猪齿鱼 API 网关，例如 `https://choerodon-gateway.example.com` |
+| 用户名 / 密码 | 你的猪齿鱼账号（密码只保存在本机，见「安全说明」） |
+| 组织 ID / 租户 ID | 默认 `1`，按部署实际填写 |
+| 关注的项目 | 点「搜索」按名称 / code / 项目 ID 找到项目后添加 |
+| 每个项目的「只看我」字段 | 默认「经办人」；也可选该项目的自定义人员字段（如「后端技术」） |
+| 会话根目录 | 派发时在该目录下按项目 code 建子目录；留空用 `~/choerodon-sessions` |
+| 控制台 URL 模板 | 可选，用于明细里的「打开控制台 / 复制链接」 |
+| 每页条数 | 默认 20 |
+
+填完点 **保存设置**，再点 **测试连接**：应显示登录成功、星标项目数、以及各关注项目的工单总数。
+
+控制台 URL 模板占位符：`{projectId}` `{projectName}` `{category}` `{orgId}` `{issueId}` `{issueNum}`。
+其中 `{issueId}` 会优先使用解密后的数字 ID（部分部署的控制台只认数字 ID）。
+
+## 使用
+
+1. 点侧栏图标进入面板，顶部切换项目。
+2. 默认「只看我 + 只看未完成」，可随时取消；搜索框支持工单号或概要关键词。
+3. 点一条工单 → 右侧出现明细；在明细里可以：
+   - **变更状态**：下拉里是当前状态机允许的流转，选择后二次确认；
+   - **评论**：查看/发表/删除自己的评论；
+   - **去处理**：选择处理类型，插件会在指定目录新建会话并把工单 brief 填进输入框，确认后回车开始。
+4. 派发产生的会话使用独立目录，不会污染日常会话的工作目录。
+
+## 安全与隐私
+
+- 密码保存在 `~/.dsh/choerodon-workbench/settings.json`，文件权限 `0600`；不写入插件配置、不回显、
+  不上传任何服务器。token 只缓存在 Host 进程内存中（6 小时，401 自动重登一次）。
+- 浏览器从不直连猪齿鱼网关：所有请求由本机 Host（Node）发出，页面只访问本机 Harness 的受认证接口。
+- 图片代理路由 `/plugin/choerodon/image` 使用每次启动生成的随机 token 校验，并拒绝 loopback / 内网地址，
+  避免工单内容反向探测本机。
+- **写操作**（改状态、发评论）以你本人身份直接调用猪齿鱼接口，需要你点击确认；不支持批量操作，
+  失败不会自动重试。派发给 agent 的会话按 Harness 自身的权限与审批策略执行。
+- 本插件不采集任何遥测，不写入除上述设置文件与会话目录之外的路径。
+
+## 已知限制
+
+- 工单描述中的私有截图若临时令牌已过期，无法从外部恢复，会显示「图片链接已失效」占位卡，
+  可在控制台查看原图。
+- 「只看未完成」按状态类型（`todo`/`doing`）判断，可在设置里调整 `unfinishedTypes`。
+- 评论只加载第一页（20 条）。
+- 派发后的会话标题由首条消息自动生成，暂不自动改名。
+- 认证走 OAuth 账号密码四步流程；暂不支持 SSO / 个人访问令牌。
+
+## 目录结构
+
+```
+dsh-choerodon-workbench/
+├── package.json          # bundle 声明：dsh.bundle.patch + dsh.client
+├── cordis.patch.yml      # 插入插件行
+├── index.js              # Host：路由、设置、派发、图片代理
+├── src/
+│   ├── choerodon.js      # 猪齿鱼 API 客户端（登录/token/项目/工单/状态/评论）
+│   ├── settings.js       # 设置读写（~/.dsh/choerodon-workbench/settings.json）
+│   ├── html.js           # 富文本白名单清洗 + 图片重写
+│   ├── brief.js          # 派发 brief 生成
+│   └── text.js           # HTML→文本、附件、链接模板
+├── client.js             # 浏览器端：侧栏图标 + 主面板 + 设置页
+├── locale/{en,zh}.json   # 插件显示名称与描述
+└── icon.svg
+```
+
+## 开发
+
+- 修改 `client.js` 后需**刷新页面**；修改 `index.js` / `src/*` 后需在插件页**禁用再启用**（或重启 Harness）。
+- 本地调试：插件以 link 方式安装时，改动源码即生效（按上一行方式重载）。
+- 代码风格：Host 半零依赖，仅使用 Node 内置模块与全局 `fetch`；Client 半为单文件 `ModuleLoader` 工厂。
+- 提 PR 前请确认 `node --check index.js client.js src/*.js` 通过，且不引入个人配置。
+
+## 许可证
+
+[MIT](./LICENSE)
+
+> 说明：Choerodon / 猪齿鱼是其各自权利人的商标；本项目与 Choerodon 官方无关，
+> 仅通过公开的 HTTP API 访问用户自己有权限的数据。

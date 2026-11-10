@@ -1,0 +1,4 @@
+# DeepSeek Harness bundle patch: inserts the Choerodon workbench plugin row.
+- insert:
+    - id: choerodon-workbench
+      name: 'dsh-choerodon-workbench'

@@ -1,0 +1,56 @@
+{
+  "name": "dsh-choerodon-workbench",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness 插件：左侧栏按项目查看我的猪齿鱼（Choerodon）工单，预览富文本明细与截图、改状态、发评论，并一键派发给 agent 处理。",
+  "type": "module",
+  "license": "MIT",
+  "author": "倪川 (nichuan)",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "choerodon",
+    "issue-tracker",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "src/*.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nichuan/dsh-choerodon-workbench.git"
+  },
+  "homepage": "https://github.com/nichuan/dsh-choerodon-workbench#readme",
+  "bugs": {
+    "url": "https://github.com/nichuan/dsh-choerodon-workbench/issues"
+  }
+}

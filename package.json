@@ -4,7 +4,7 @@
   "description": "DeepSeek Harness 插件：左侧栏按项目查看我的猪齿鱼（Choerodon）工单，预览富文本明细与截图、改状态、发评论，并一键派发给 agent 处理。",
   "type": "module",
   "license": "MIT",
-  "author": "倪川 (nichuan)",
+  "author": "nichuan",
   "keywords": [
     "dsh",
     "dsh-plugin",

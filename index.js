@@ -6,6 +6,7 @@ import path from 'node:path'
 import { createSettingsStore, maskedSettings, SETTINGS_DIR } from './src/settings.js'
 import {
   ChoerodonClient,
+  dateCondition,
   keywordCondition,
   memberCondition,
   normalizeIssue,
@@ -112,6 +113,28 @@ function boolParam(params, name, fallback = false) {
   const value = params.get(name)
   if (value === null) return fallback
   return value === '1' || value === 'true'
+}
+
+function pad2(value) {
+  return String(value).padStart(2, '0')
+}
+
+function localToday() {
+  const now = new Date()
+  return `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())}`
+}
+
+/** Subtract calendar months with month-end clamping (May 31 - 3m => Feb 28). */
+function monthsBackDate(months) {
+  const now = new Date()
+  const wantedMonth = ((now.getMonth() - months) % 12 + 12) % 12
+  const result = new Date(now.getFullYear(), now.getMonth() - months, now.getDate())
+  if (result.getMonth() !== wantedMonth) result.setDate(0)
+  return `${result.getFullYear()}-${pad2(result.getMonth() + 1)}-${pad2(result.getDate())}`
+}
+
+function validDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(`${value}T00:00:00Z`))
 }
 
 // ------------------------------------------------------------------- settings
@@ -224,6 +247,8 @@ async function getTasks({ store, client }, request) {
   const keyword = String(params.get('keyword') || '').trim()
   const selfOnly = boolParam(params, 'selfOnly', true)
   const unfinished = boolParam(params, 'unfinished', true)
+  const rawSince = String(params.get('since') || '').trim()
+  const rawUntil = String(params.get('until') || '').trim()
   const project = settings.projects.find((item) => item.projectId === projectId) || {
     projectId,
     code: '',
@@ -270,6 +295,23 @@ async function getTasks({ store, client }, request) {
   const keywordEntry = keywordCondition(keyword)
   if (keywordEntry) conditions.push(keywordEntry)
 
+  // Creation-date window. Both ends are optional: one missing end is filled
+  // from the configured default lookback / today; both empty means "all time".
+  let since = validDate(rawSince) ? rawSince : ''
+  let until = validDate(rawUntil) ? rawUntil : ''
+  let dateActive = false
+  if (since || until) {
+    if (!since) since = monthsBackDate(settings.defaultLookbackMonths || 3)
+    if (!until) until = localToday()
+    if (since <= until) {
+      conditions.push(dateCondition(since, until))
+      dateActive = true
+    } else {
+      since = ''
+      until = ''
+    }
+  }
+
   const body = { treeFlag: true, withSubIssues: false }
   if (conditions.length > 0) body.conditions = conditions
 
@@ -277,7 +319,7 @@ async function getTasks({ store, client }, request) {
   const rows = Array.isArray(data?.content) ? data.content : []
   const total = Number(data?.totalElements ?? rows.length)
 
-  if (selfOnly && !unfinished && !keyword && filterLabel && !filterWarning) {
+  if (selfOnly && !unfinished && !keyword && !dateActive && filterLabel && !filterWarning) {
     try {
       const baseline = await client.baselineTotal(projectId)
       if (Number.isFinite(baseline) && baseline > 0 && total >= baseline) filterWarning = true
@@ -293,7 +335,15 @@ async function getTasks({ store, client }, request) {
     size,
     total,
     totalPages: Math.max(1, Number(data?.totalPages ?? Math.ceil(total / size) ?? 1)),
-    filter: { selfOnly, unfinished, label: filterLabel, warning: filterWarning },
+    filter: {
+      selfOnly,
+      unfinished,
+      label: filterLabel,
+      warning: filterWarning,
+      dateActive,
+      since: dateActive ? since : '',
+      until: dateActive ? until : '',
+    },
   }
 }
 

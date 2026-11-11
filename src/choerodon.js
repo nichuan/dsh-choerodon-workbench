@@ -504,6 +504,19 @@ export function statusCondition(statusIds) {
   }
 }
 
+/** Build the `conditions` entry for a creation-date range (inclusive days, YYYY-MM-DD). */
+export function dateCondition(since, until) {
+  return {
+    field: { fieldCode: 'creationDate', fieldType: 'datetime', predefined: true, name: '创建时间' },
+    relationship: 'AND',
+    operation: 'BETWEEN',
+    betweenValues: {
+      first: { valueDate: `${since} 00:00:00` },
+      second: { valueDate: `${until} 23:59:59` },
+    },
+  }
+}
+
 /** Build the `conditions` entry for a keyword search on issue number or summary. */
 export function keywordCondition(keyword) {
   const query = String(keyword || '').trim()

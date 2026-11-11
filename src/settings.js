@@ -18,6 +18,7 @@ export const DEFAULT_SETTINGS = {
   organizationId: '1',
   tenantId: '1',
   pageSize: 20,
+  defaultLookbackMonths: 3,
   sessionRoot: '',
   dispatchMode: 'draft',
   agentPreset: '',
@@ -46,6 +47,10 @@ function mergeSettings(base, patch) {
   if (!Array.isArray(next.unfinishedTypes) || next.unfinishedTypes.length === 0) {
     next.unfinishedTypes = DEFAULT_SETTINGS.unfinishedTypes
   }
+  const lookback = Number(next.defaultLookbackMonths)
+  next.defaultLookbackMonths = Number.isFinite(lookback)
+    ? Math.min(120, Math.max(0, Math.round(lookback)))
+    : DEFAULT_SETTINGS.defaultLookbackMonths
   return next
 }
 

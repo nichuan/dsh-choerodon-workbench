@@ -84,6 +84,71 @@ window.__ModuleLoader__.load({
       return `${match[1]}-${match[2]}-${match[3]}`
     }
 
+    // ------------------------------------------------- creation-date range
+
+    const RANGE_KEY = 'choerodon-workbench:date-range'
+    const RANGE_PRESETS = [
+      { value: 'm1', label: '近 1 个月', months: 1 },
+      { value: 'm3', label: '近 3 个月', months: 3 },
+      { value: 'm6', label: '近 6 个月', months: 6 },
+      { value: 'm12', label: '近 1 年', months: 12 },
+      { value: 'all', label: '全部时间', months: 0 },
+      { value: 'custom', label: '自定义', months: null },
+    ]
+
+    function fmtDate(date) {
+      const pad = (n) => String(n).padStart(2, '0')
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+    }
+
+    /** Subtract calendar months, clamping month-end overflow (May 31 - 3m => Feb 28). */
+    function monthsAgo(months) {
+      const now = new Date()
+      const wantedMonth = ((now.getMonth() - months) % 12 + 12) % 12
+      const result = new Date(now.getFullYear(), now.getMonth() - months, now.getDate())
+      if (result.getMonth() !== wantedMonth) result.setDate(0)
+      return result
+    }
+
+    function presetRange(months) {
+      if (!months || months <= 0) return { since: '', until: '', preset: 'all' }
+      return { since: fmtDate(monthsAgo(months)), until: fmtDate(new Date()), preset: `m${months}` }
+    }
+
+    function defaultRange(months) {
+      const value = Number(months)
+      return presetRange(Number.isFinite(value) && value >= 0 && value <= 120 ? value : 3)
+    }
+
+    function readSavedRange() {
+      try {
+        const raw = window.localStorage.getItem(RANGE_KEY)
+        if (!raw) return null
+        const saved = JSON.parse(raw)
+        const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))
+        if (saved && typeof saved === 'object' && validDate(saved.since) && validDate(saved.until)) {
+          return { since: saved.since, until: saved.until, preset: String(saved.preset || 'custom') }
+        }
+        if (saved && saved.preset === 'all') return { since: '', until: '', preset: 'all' }
+      } catch (error) {
+        /* localStorage may be unavailable */
+      }
+      return null
+    }
+
+    function saveRange(range) {
+      try {
+        window.localStorage.setItem(RANGE_KEY, JSON.stringify(range))
+      } catch (error) {
+        /* localStorage may be unavailable */
+      }
+    }
+
+    function rangeLabel(range) {
+      if (!range || range.preset === 'all' || !range.since) return '全部时间'
+      return `${range.since} ~ ${range.until}`
+    }
+
     // --------------------------------------------------------------- styles
 
     const C = {
@@ -120,6 +185,28 @@ window.__ModuleLoader__.load({
         padding: '10px 14px',
         borderBottom: `1px solid ${C.border}`,
         flexWrap: 'wrap',
+      },
+      filterBar: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        padding: '7px 14px',
+        borderBottom: `1px solid ${C.border}`,
+        background: C.layer1,
+        flexWrap: 'wrap',
+        fontSize: 12,
+        color: C.sub,
+      },
+      dateInput: {
+        height: 26,
+        padding: '0 6px',
+        borderRadius: 6,
+        border: `1px solid ${C.border}`,
+        background: C.bg,
+        color: C.text,
+        fontSize: 11,
+        fontFamily: 'inherit',
+        colorScheme: 'inherit',
       },
       input: {
         height: 28,
@@ -461,6 +548,9 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = React.useState(null)
       const [dispatchOpen, setDispatchOpen] = React.useState(false)
       const [previewSrc, setPreviewSrc] = React.useState('')
+      // null until the boot response supplies the configured default lookback.
+      const [range, setRange] = React.useState(null)
+      const [rangeQuery, setRangeQuery] = React.useState(null)
 
       const settings = boot && boot.settings ? boot.settings : null
       const ready = Boolean(boot && boot.ready)
@@ -477,6 +567,8 @@ window.__ModuleLoader__.load({
             const preferred = projectData.defaultProjectId || ''
             const first = watched.find((item) => item.projectId === preferred) || watched[0]
             if (first) setProjectId(first.projectId)
+            const months = state.settings ? state.settings.defaultLookbackMonths : undefined
+            setRange(readSavedRange() || defaultRange(months))
           })
           .catch((error) => {
             if (!cancelled) setBootError(errorText(error))
@@ -514,12 +606,19 @@ window.__ModuleLoader__.load({
         return () => clearTimeout(timer)
       }, [keyword])
 
+      // Date inputs can fire several changes in a row; debounce the query too.
       React.useEffect(() => {
-        setPage(0)
-      }, [projectId, query, selfOnly, unfinished])
+        if (!range) return undefined
+        const timer = setTimeout(() => setRangeQuery(range), 250)
+        return () => clearTimeout(timer)
+      }, [range])
 
       React.useEffect(() => {
-        if (!ready || !projectId) return undefined
+        setPage(0)
+      }, [projectId, query, selfOnly, unfinished, range])
+
+      React.useEffect(() => {
+        if (!ready || !projectId || !rangeQuery) return undefined
         let cancelled = false
         setLoading(true)
         setListError('')
@@ -530,6 +629,8 @@ window.__ModuleLoader__.load({
           keyword: query,
           selfOnly: selfOnly ? 1 : 0,
           unfinished: unfinished ? 1 : 0,
+          since: rangeQuery.since,
+          until: rangeQuery.until,
         })
           .then((data) => {
             if (cancelled) return
@@ -544,7 +645,7 @@ window.__ModuleLoader__.load({
         return () => {
           cancelled = true
         }
-      }, [ready, projectId, page, query, selfOnly, unfinished, tick])
+      }, [ready, projectId, page, query, selfOnly, unfinished, rangeQuery, tick])
 
       const selected = React.useMemo(
         () => list.items.find((item) => item.issueId === selectedId) || null,
@@ -640,6 +741,33 @@ window.__ModuleLoader__.load({
         }
       }
 
+      function applyRange(next) {
+        setRange(next)
+        saveRange(next)
+      }
+
+      function changePreset(value) {
+        if (value === 'custom') {
+          const base = range && range.since ? range : presetRange(3)
+          applyRange({ ...base, preset: 'custom' })
+          return
+        }
+        const preset = RANGE_PRESETS.find((item) => item.value === value)
+        if (preset) applyRange(presetRange(preset.months))
+      }
+
+      function changeSince(value) {
+        if (!range) return
+        const until = range.until || fmtDate(new Date())
+        applyRange({ since: value, until: value && value > until ? value : until, preset: 'custom' })
+      }
+
+      function changeUntil(value) {
+        if (!range) return
+        const since = range.since || fmtDate(monthsAgo(3))
+        applyRange({ since: value && since > value ? value : since, until: value, preset: 'custom' })
+      }
+
       async function dispatch(kind) {
         if (!detail) return
         setDispatchOpen(false)
@@ -729,7 +857,7 @@ window.__ModuleLoader__.load({
           }, '刷新'),
         ),
         h(Notice, { notice }),
-        heightHint(project, list),
+        dateFilterBar(list, range),
         h(
           'div',
           { style: styles.body },
@@ -746,7 +874,15 @@ window.__ModuleLoader__.load({
               : null,
             !loading && !listError && list.items.length === 0
               ? h('div', { style: styles.empty },
-                  query ? '没有匹配的工单，换个关键词试试。' : '这个项目下没有符合条件的工单。')
+                  query
+                    ? '没有匹配的工单，换个关键词或放宽创建时间范围试试。'
+                    : list.filter && list.filter.dateActive
+                      ? '这个创建时间范围内没有符合条件的工单；可改成「全部时间」，或取消「只看未完成 / 只看我」。'
+                      : '这个项目下没有符合条件的工单。',
+                  list.filter && list.filter.dateActive
+                    ? h('div', { style: { marginTop: 12 } },
+                        h('button', { type: 'button', style: styles.button, onClick: () => changePreset('all') }, '查看全部时间'))
+                    : null)
               : null,
             list.items.map((item) =>
               h(
@@ -1016,16 +1152,46 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function heightHint(project, list) {
-      if (!project) return null
+    function dateFilterBar(list, range) {
+      const preset = range ? range.preset : 'm3'
+      const known = RANGE_PRESETS.some((item) => item.value === preset)
       const filter = list.filter
-      if (!filter) return null
       return h(
         'div',
-        { style: { padding: '6px 14px', fontSize: 11, color: C.sub, borderBottom: `1px solid ${C.border}` } },
-        `项目 ${project.name}（${project.code}）` +
-          (filter.selfOnly && filter.label ? ` · 默认过滤 ${filter.label} = 我` : '') +
-          (filter.unfinished ? ' · 只看未完成' : ''),
+        { style: styles.filterBar },
+        h('span', { style: { fontWeight: 600, color: C.text } }, '创建时间'),
+        h('select', {
+          style: { ...styles.input, height: 26, fontSize: 11 },
+          value: preset,
+          onChange: (event) => changePreset(event.target.value),
+          'aria-label': '创建时间范围',
+        },
+          !known && /^m\d+$/.test(preset)
+            ? h('option', { value: preset }, `近 ${preset.slice(1)} 个月（默认）`)
+            : null,
+          RANGE_PRESETS.map((item) => h('option', { key: item.value, value: item.value }, item.label)),
+        ),
+        h('input', {
+          type: 'date',
+          style: styles.dateInput,
+          value: range ? range.since : '',
+          onChange: (event) => changeSince(event.target.value),
+          'aria-label': '创建时间起始日期',
+        }),
+        h('span', null, '~'),
+        h('input', {
+          type: 'date',
+          style: styles.dateInput,
+          value: range ? range.until : '',
+          onChange: (event) => changeUntil(event.target.value),
+          'aria-label': '创建时间结束日期',
+        }),
+        h('div', { style: { flex: 1 } }),
+        h('span', { style: { fontSize: 11 } },
+          (filter && filter.selfOnly && filter.label ? `${filter.label} = 我 · ` : '') +
+          (filter && filter.unfinished ? '只看未完成 · ' : '') +
+          (filter && filter.dateActive ? `创建于 ${filter.since} ~ ${filter.until} · ` : '全部时间 · ') +
+          `共 ${list.total} 条`),
       )
     }
 
@@ -1217,10 +1383,24 @@ window.__ModuleLoader__.load({
           '可用占位符：{projectId} {projectName} {category} {orgId} {issueId} {issueNum}；留空则不显示控制台按钮。'),
         h('div', { style: { display: 'flex', gap: 24, alignItems: 'flex-start' } },
           field('每页条数', h('input', { style: { ...styles.input, width: 100 }, type: 'number', value: String(draft.pageSize || 20), onChange: (e) => patchDraft({ pageSize: Number(e.target.value) || 20 }) })),
+          field(
+            '默认时间范围（月）',
+            h('input', {
+              style: { ...styles.input, width: 100 },
+              type: 'number',
+              min: 0,
+              max: 120,
+              value: String(draft.defaultLookbackMonths ?? 3),
+              onChange: (e) =>
+                patchDraft({ defaultLookbackMonths: Math.max(0, Math.min(120, Number(e.target.value) || 0)) }),
+            }),
+          ),
           field('派发模式', h('select', { style: styles.input, value: draft.dispatchMode || 'draft', onChange: (e) => patchDraft({ dispatchMode: e.target.value }) },
             h('option', { value: 'draft' }, '草稿（确认后回车）'),
           )),
         ),
+        h('div', { style: { fontSize: 10, color: C.sub, marginTop: -6, marginBottom: 12 } },
+          '默认只看创建时间在近 3 个月内的工单；填 0 表示不限时间。面板顶部可随时改快捷范围或自定义起止日期，改动会记住。'),
 
         h('div', { style: styles.sectionTitle }, '关注的项目'),
         projects.map((project) =>

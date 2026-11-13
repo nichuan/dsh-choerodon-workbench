@@ -30,12 +30,17 @@ window.__ModuleLoader__.load({
           url.searchParams.set(key, String(value))
         }
       }
-      const response = await fetch(url.toString(), {
-        cache: 'no-store',
-        credentials: 'same-origin',
-        ...init,
-        headers: { accept: 'application/json', ...(init && init.headers ? init.headers : {}) },
-      })
+      let response
+      try {
+        response = await fetch(url.toString(), {
+          cache: 'no-store',
+          credentials: 'same-origin',
+          ...init,
+          headers: { accept: 'application/json', ...(init && init.headers ? init.headers : {}) },
+        })
+      } catch (error) {
+        throw new Error(`本机插件接口连接失败：${errorText(error)}。请检查插件是否启用后重试。`)
+      }
       let data = null
       try {
         data = await response.json()
@@ -43,7 +48,14 @@ window.__ModuleLoader__.load({
         throw new Error(`猪齿鱼插件后端返回了非 JSON 响应（HTTP ${response.status}）`)
       }
       if (!data || data.ok !== true) {
-        throw new Error((data && data.error) || `请求失败（HTTP ${response.status}）`)
+        const message = response.status === 401
+          ? '猪齿鱼会话无效或已过期，请在设置中重新测试连接。'
+          : response.status === 403
+            ? '当前猪齿鱼账号无权执行此操作，请检查项目权限。'
+            : response.status >= 500
+              ? `猪齿鱼服务暂时异常（HTTP ${response.status}），请稍后重试。`
+              : (data && data.error) || `请求失败（HTTP ${response.status}）`
+        throw new Error(message)
       }
       return data
     }
@@ -87,6 +99,16 @@ window.__ModuleLoader__.load({
     // ------------------------------------------------- creation-date range
 
     const RANGE_KEY = 'choerodon-workbench:date-range'
+    const PROJECT_PREFS_KEY = 'choerodon-workbench:project-preferences:v1'
+    const SELECTED_PROJECT_KEY = 'choerodon-workbench:selected-project'
+    const DEFAULT_SORT = 'lastUpdateDate,desc'
+    const DISPATCH_LABELS = { fix: '数据修复', bug: 'Bug 排查', dev: '需求开发' }
+    const SORT_OPTIONS = [
+      { value: 'lastUpdateDate,desc', label: '最近更新' },
+      { value: 'lastUpdateDate,asc', label: '最久未更新' },
+      { value: 'creationDate,desc', label: '最新创建' },
+      { value: 'creationDate,asc', label: '最早创建' },
+    ]
     const RANGE_PRESETS = [
       { value: 'm1', label: '近 1 个月', months: 1 },
       { value: 'm3', label: '近 3 个月', months: 3 },
@@ -136,11 +158,53 @@ window.__ModuleLoader__.load({
       return null
     }
 
-    function saveRange(range) {
+    function readProjectPrefs(projectId) {
+      if (!projectId) return null
       try {
-        window.localStorage.setItem(RANGE_KEY, JSON.stringify(range))
+        const all = JSON.parse(window.localStorage.getItem(PROJECT_PREFS_KEY) || '{}')
+        const saved = all && all[String(projectId)]
+        if (!saved || typeof saved !== 'object') return null
+        const range = saved.range && typeof saved.range === 'object' ? saved.range : null
+        if (range) {
+          const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))
+          if (range.preset === 'all') saved.range = { since: '', until: '', preset: 'all' }
+          else if (!validDate(range.since) || !validDate(range.until)) saved.range = null
+        }
+        return {
+          selfOnly: typeof saved.selfOnly === 'boolean' ? saved.selfOnly : true,
+          unfinished: typeof saved.unfinished === 'boolean' ? saved.unfinished : true,
+          range: saved.range || null,
+          sort: SORT_OPTIONS.some((item) => item.value === saved.sort) ? saved.sort : DEFAULT_SORT,
+        }
+      } catch (error) {
+        return null
+      }
+    }
+
+    function writeProjectPrefs(projectId, prefs) {
+      if (!projectId) return
+      try {
+        const all = JSON.parse(window.localStorage.getItem(PROJECT_PREFS_KEY) || '{}')
+        all[String(projectId)] = prefs
+        window.localStorage.setItem(PROJECT_PREFS_KEY, JSON.stringify(all))
       } catch (error) {
         /* localStorage may be unavailable */
+      }
+    }
+
+    function saveSelectedProject(projectId) {
+      try {
+        window.localStorage.setItem(SELECTED_PROJECT_KEY, String(projectId || ''))
+      } catch (error) {
+        /* localStorage may be unavailable */
+      }
+    }
+
+    function readSelectedProject() {
+      try {
+        return window.localStorage.getItem(SELECTED_PROJECT_KEY) || ''
+      } catch (error) {
+        return ''
       }
     }
 
@@ -494,14 +558,22 @@ window.__ModuleLoader__.load({
     }
 
     function Notice(props) {
-      if (!props.notice) return null
-      return h('div', { style: styles.notice(props.notice.tone) }, props.notice.text)
+      const notice = props.notice
+      if (!notice) return null
+      return h('div', { style: { ...styles.notice(notice.tone), display: 'flex', alignItems: 'center', gap: 10 } },
+        h('span', { style: { flex: 1, minWidth: 0 } }, notice.text),
+        notice.path
+          ? h('button', { type: 'button', style: styles.buttonTiny, onClick: () => copyText(notice.path) }, '复制会话路径')
+          : null,
+        notice.sticky
+          ? h('button', { type: 'button', style: styles.buttonTiny, onClick: props.onDismiss, 'aria-label': '关闭提示' }, '关闭')
+          : null,
+      )
     }
 
     // ---------------------------------------------------------- dispatch glue
 
-    async function startDispatch({ projectId, issueId, kind }) {
-      const payload = await apiPost('/dispatch', { projectId, issueId, kind })
+    async function startDispatch(payload) {
       const workspaces = service('workspaces')
       const uiWorkspace = service('uiWorkspace')
       let workspaceId = undefined
@@ -514,7 +586,8 @@ window.__ModuleLoader__.load({
         uiWorkspace.startSession(workspaceId, { prompt: payload.prompt, whenDraftExists: 'replace' })
         return {
           tone: 'ok',
-          text: `已在 ${payload.dir} 新建会话并填好草稿（${payload.title}），确认后按回车开始。`,
+          text: `已为 ${payload.title} 创建会话草稿。请在会话中检查内容，确认后按回车开始。`,
+          path: payload.dir,
         }
       }
       throw new Error('会话服务不可用，无法新建会话')
@@ -551,6 +624,13 @@ window.__ModuleLoader__.load({
       // null until the boot response supplies the configured default lookback.
       const [range, setRange] = React.useState(null)
       const [rangeQuery, setRangeQuery] = React.useState(null)
+      const [sort, setSort] = React.useState(DEFAULT_SORT)
+      const [prefsReady, setPrefsReady] = React.useState(false)
+      const [bootTick, setBootTick] = React.useState(0)
+      const [listUpdatedAt, setListUpdatedAt] = React.useState(0)
+      const [dispatchPayload, setDispatchPayload] = React.useState(null)
+      const [dispatchDraft, setDispatchDraft] = React.useState('')
+      const [dispatchKind, setDispatchKind] = React.useState('bug')
 
       const settings = boot && boot.settings ? boot.settings : null
       const ready = Boolean(boot && boot.ready)
@@ -564,11 +644,20 @@ window.__ModuleLoader__.load({
             setBoot(state)
             const watched = projectData.projects || []
             setProjects(watched)
-            const preferred = projectData.defaultProjectId || ''
+            const preferred = readSelectedProject() || projectData.defaultProjectId || ''
             const first = watched.find((item) => item.projectId === preferred) || watched[0]
-            if (first) setProjectId(first.projectId)
-            const months = state.settings ? state.settings.defaultLookbackMonths : undefined
-            setRange(readSavedRange() || defaultRange(months))
+            if (first) {
+              setProjectId(first.projectId)
+              saveSelectedProject(first.projectId)
+              const saved = readProjectPrefs(first.projectId)
+              setSelfOnly(saved ? saved.selfOnly : true)
+              setUnfinished(saved ? saved.unfinished : true)
+              setRange((saved && saved.range) || readSavedRange() || defaultRange(state.settings?.defaultLookbackMonths))
+              setSort(saved ? saved.sort : DEFAULT_SORT)
+            } else {
+              setRange(defaultRange(state.settings?.defaultLookbackMonths))
+            }
+            setPrefsReady(true)
           })
           .catch((error) => {
             if (!cancelled) setBootError(errorText(error))
@@ -576,13 +665,19 @@ window.__ModuleLoader__.load({
         return () => {
           cancelled = true
         }
-      }, [])
+      }, [bootTick])
 
       React.useEffect(() => {
-        if (!notice) return undefined
+        if (!notice || notice.sticky) return undefined
         const timer = setTimeout(() => setNotice(null), 6000)
         return () => clearTimeout(timer)
       }, [notice])
+
+      React.useEffect(() => {
+        if (!prefsReady || !projectId) return
+        writeProjectPrefs(projectId, { selfOnly, unfinished, range, sort })
+        saveSelectedProject(projectId)
+      }, [prefsReady, projectId, selfOnly, unfinished, range, sort])
 
       React.useEffect(() => {
         if (!previewSrc) return undefined
@@ -615,7 +710,7 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         setPage(0)
-      }, [projectId, query, selfOnly, unfinished, range])
+      }, [projectId, query, selfOnly, unfinished, range, sort])
 
       React.useEffect(() => {
         if (!ready || !projectId || !rangeQuery) return undefined
@@ -631,10 +726,12 @@ window.__ModuleLoader__.load({
           unfinished: unfinished ? 1 : 0,
           since: rangeQuery.since,
           until: rangeQuery.until,
+          sort,
         })
           .then((data) => {
             if (cancelled) return
             setList(data)
+            setListUpdatedAt(Date.now())
             setLoading(false)
           })
           .catch((error) => {
@@ -645,7 +742,7 @@ window.__ModuleLoader__.load({
         return () => {
           cancelled = true
         }
-      }, [ready, projectId, page, query, selfOnly, unfinished, rangeQuery, tick])
+      }, [ready, projectId, page, query, selfOnly, unfinished, rangeQuery, sort, tick])
 
       const selected = React.useMemo(
         () => list.items.find((item) => item.issueId === selectedId) || null,
@@ -743,7 +840,35 @@ window.__ModuleLoader__.load({
 
       function applyRange(next) {
         setRange(next)
-        saveRange(next)
+      }
+
+      function switchProject(nextProjectId) {
+        if (!nextProjectId || nextProjectId === projectId) return
+        writeProjectPrefs(projectId, { selfOnly, unfinished, range, sort })
+        saveSelectedProject(nextProjectId)
+        const saved = readProjectPrefs(nextProjectId)
+        setProjectId(nextProjectId)
+        setSelfOnly(saved ? saved.selfOnly : true)
+        setUnfinished(saved ? saved.unfinished : true)
+        setRange((saved && saved.range) || defaultRange(settings?.defaultLookbackMonths))
+        setSort(saved ? saved.sort : DEFAULT_SORT)
+        setList({ items: [], total: 0, totalPages: 1, page: 0, size: list.size || 20, filter: null })
+        setListError('')
+        setListUpdatedAt(0)
+        setSelectedId('')
+        setDetail(null)
+        setPage(0)
+      }
+
+      function clearProjectFilters() {
+        const next = defaultRange(settings?.defaultLookbackMonths)
+        setSelfOnly(true)
+        setUnfinished(true)
+        setKeyword('')
+        setQuery('')
+        setRange(next)
+        setSort(DEFAULT_SORT)
+        setPage(0)
       }
 
       function changePreset(value) {
@@ -768,22 +893,41 @@ window.__ModuleLoader__.load({
         applyRange({ since: value && since > value ? value : since, until: value, preset: 'custom' })
       }
 
-      async function dispatch(kind) {
+      async function prepareDispatch(kind) {
         if (!detail) return
         setDispatchOpen(false)
+        setBusy('preview')
+        try {
+          const payload = await apiPost('/dispatch', { projectId, issueId: detail.issue.issueId, kind })
+          setDispatchPayload(payload)
+          setDispatchDraft(payload.prompt || '')
+          setDispatchKind(kind)
+        } catch (error) {
+          setNotice({ tone: 'error', text: `准备草稿失败：${errorText(error)}` })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      async function confirmDispatch() {
+        if (!dispatchPayload || !detail) return
         setBusy('dispatch')
         try {
-          const result = await startDispatch({ projectId, issueId: detail.issue.issueId, kind })
-          setNotice(result)
+          const directory = await apiPost('/dispatch/confirm', { projectId })
+          const result = await startDispatch({ ...dispatchPayload, dir: directory.dir, prompt: dispatchDraft })
+          setDispatchPayload(null)
+          setNotice({ ...result, sticky: true })
         } catch (error) {
-          setNotice({ tone: 'error', text: `派发失败：${errorText(error)}` })
+          setNotice({ tone: 'error', text: `创建会话失败：${errorText(error)}` })
         } finally {
           setBusy('')
         }
       }
 
       if (bootError) {
-        return h('div', { style: styles.page }, h('div', { style: styles.empty }, `插件后端不可用：${bootError}`))
+        return h('div', { style: styles.page }, h('div', { style: styles.empty },
+          h('div', { style: { color: C.error, marginBottom: 8 } }, `插件后端不可用：${bootError}`),
+          h('button', { type: 'button', style: styles.button, onClick: () => { setBootError(''); setBoot(null); setBootTick((v) => v + 1) } }, '重试连接')))
       }
 
       if (!boot) {
@@ -828,7 +972,7 @@ window.__ModuleLoader__.load({
           h('select', {
             style: { ...styles.input, minWidth: 190 },
             value: projectId,
-            onChange: (event) => setProjectId(event.target.value),
+            onChange: (event) => switchProject(event.target.value),
             'aria-label': '选择项目',
           },
             projects.map((item) =>
@@ -856,17 +1000,30 @@ window.__ModuleLoader__.load({
             title: '刷新',
           }, '刷新'),
         ),
-        h(Notice, { notice }),
-        dateFilterBar(list, range),
+        h(Notice, { notice, onDismiss: () => setNotice(null) }),
+        dateFilterBar(list, range, {
+          onPreset: changePreset,
+          onSince: changeSince,
+          onUntil: changeUntil,
+          sort,
+          onSort: setSort,
+          onClear: clearProjectFilters,
+        }),
         h(
           'div',
           { style: styles.body },
           h(
             'div',
             { style: styles.listPane },
-            loading ? h('div', { style: styles.empty }, '加载中…') : null,
+            loading && list.items.length === 0
+              ? h('div', { style: styles.empty, role: 'status' }, '正在加载工单…')
+              : null,
+            loading && list.items.length > 0
+              ? h('div', { style: { ...styles.notice('ok'), padding: '5px 9px', fontSize: 11 }, role: 'status' }, '正在刷新，暂时保留上次列表…')
+              : null,
             listError
-              ? h('div', { style: styles.empty }, h('div', { style: { color: C.error, marginBottom: 8 } }, listError),
+              ? h('div', { style: styles.notice('error'), role: 'alert' },
+                  h('div', { style: { marginBottom: 6 } }, list.items.length > 0 ? `刷新失败，仍显示上次结果：${listError}` : listError),
                   h('button', { type: 'button', style: styles.button, onClick: () => setTick((v) => v + 1) }, '重试'))
               : null,
             !loading && !listError && list.filter && list.filter.warning
@@ -896,13 +1053,14 @@ window.__ModuleLoader__.load({
                 h('div', { style: styles.rowTop },
                   h('span', { style: styles.num }, item.issueNum),
                   h(StatusBadge, { name: item.statusName, type: item.statusType }),
-                  h('span', { style: styles.badge }, item.typeName || item.typeCode || '—'),
+                  h('span', { style: styles.badge }, item.parentId ? '子任务' : item.typeName || item.typeCode || '—'),
                   h('div', { style: { flex: 1 } }),
-                  h('span', { style: { fontSize: 11, color: C.sub } }, formatTime(item.lastUpdateDate || item.creationDate)),
+                  h('span', { style: { fontSize: 11, color: C.sub }, title: `更新时间：${item.lastUpdateDate || '未知'}` },
+                    `更新于 ${formatTime(item.lastUpdateDate || item.creationDate) || '未知'}`),
                 ),
                 h('div', { style: styles.summary }, item.summary || '(无概要)'),
                 h('div', { style: styles.meta },
-                  `${item.assignee ? `经办人 ${item.assignee}` : '未指派'}${item.priority ? ` · ${item.priority}` : ''}`),
+                  `${item.assignee ? `经办人 ${item.assignee}` : '未指派'}${item.priority ? ` · 优先级 ${item.priority}` : ''}${item.creationDate ? ` · 创建 ${item.creationDate.slice(0, 10)}` : ''}`),
               ),
             ),
           ),
@@ -925,6 +1083,8 @@ window.__ModuleLoader__.load({
             onClick: () => setPage((value) => value + 1),
           }, '下一页'),
           h('div', { style: { flex: 1 } }),
+          h('span', { style: { fontSize: 11 }, title: listUpdatedAt ? `列表更新于 ${new Date(listUpdatedAt).toLocaleTimeString()}` : '' },
+            listUpdatedAt ? `更新于 ${new Date(listUpdatedAt).toLocaleTimeString()}` : ''),
           h('span', { style: { fontSize: 11 } }, `每页 ${list.size || 20} 条`),
         ),
         previewSrc
@@ -975,6 +1135,42 @@ window.__ModuleLoader__.load({
                   },
                 },
                 '点击空白处或按 Esc 关闭',
+              ),
+            )
+          : null,
+        dispatchPayload
+          ? h('div', {
+              role: 'dialog',
+              'aria-modal': 'true',
+              'aria-label': '派发草稿预览',
+              style: {
+                position: 'fixed', inset: 0, zIndex: 1000,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                padding: 20, background: 'rgba(0,0,0,0.56)',
+              },
+            },
+              h('div', { style: {
+                width: 'min(760px, 96vw)', maxHeight: '88vh', display: 'flex', flexDirection: 'column',
+                border: `1px solid ${C.border}`, borderRadius: 12, background: C.layer1,
+                color: C.text, boxShadow: '0 18px 60px rgba(0,0,0,0.28)', overflow: 'hidden',
+              } },
+                h('div', { style: { padding: '14px 18px', borderBottom: `1px solid ${C.border}` } },
+                  h('div', { style: { fontSize: 14, fontWeight: 650, marginBottom: 4 } }, `预览派发草稿 · ${DISPATCH_LABELS[dispatchKind] || '处理'}`),
+                  h('div', { style: { fontSize: 11, color: C.sub } }, `${dispatchPayload.title || ''} · 可在下方编辑本次指令`),
+                ),
+                h('textarea', {
+                  style: { ...styles.textarea, flex: 1, minHeight: 240, margin: 14, width: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', lineHeight: '18px' },
+                  value: dispatchDraft,
+                  onChange: (event) => setDispatchDraft(event.target.value),
+                  'aria-label': '编辑 agent 派发指令',
+                }),
+                h('div', { style: { padding: '0 18px 12px', color: C.warn, fontSize: 11, lineHeight: '16px' } },
+                  '确认后会新建会话，并替换该会话当前未提交的草稿；agent 只有在你进入会话并按回车后才开始执行。'),
+                h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '12px 18px', borderTop: `1px solid ${C.border}` } },
+                  h('button', { type: 'button', style: styles.button, disabled: busy === 'dispatch', onClick: () => setDispatchPayload(null) }, '取消'),
+                  h('button', { type: 'button', style: styles.buttonPrimary, disabled: busy === 'dispatch' || !dispatchDraft.trim(), onClick: confirmDispatch },
+                    busy === 'dispatch' ? '正在创建会话…' : '确认并创建会话'),
+                ),
               ),
             )
           : null,
@@ -1049,9 +1245,9 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button',
               style: styles.buttonPrimary,
-              disabled: busy === 'dispatch',
+              disabled: busy === 'dispatch' || busy === 'preview',
               onClick: () => setDispatchOpen((value) => !value),
-            }, busy === 'dispatch' ? '正在创建会话…' : '去处理 ▾'),
+            }, busy === 'dispatch' ? '正在创建会话…' : busy === 'preview' ? '正在准备草稿…' : '去处理 ▾'),
             dispatchOpen
               ? h('div', {
                   style: {
@@ -1070,9 +1266,9 @@ window.__ModuleLoader__.load({
                     gap: 2,
                   },
                 },
-                  h('button', { type: 'button', style: { ...styles.button, textAlign: 'left', border: 'none' }, onClick: () => dispatch('fix') }, '数据修复'),
-                  h('button', { type: 'button', style: { ...styles.button, textAlign: 'left', border: 'none' }, onClick: () => dispatch('bug') }, 'Bug 排查'),
-                  h('button', { type: 'button', style: { ...styles.button, textAlign: 'left', border: 'none' }, onClick: () => dispatch('dev') }, '需求开发'),
+                  h('button', { type: 'button', style: { ...styles.button, textAlign: 'left', border: 'none' }, onClick: () => prepareDispatch('fix') }, '数据修复'),
+                  h('button', { type: 'button', style: { ...styles.button, textAlign: 'left', border: 'none' }, onClick: () => prepareDispatch('bug') }, 'Bug 排查'),
+                  h('button', { type: 'button', style: { ...styles.button, textAlign: 'left', border: 'none' }, onClick: () => prepareDispatch('dev') }, '需求开发'),
                   h('div', { style: { fontSize: 10, color: C.sub, padding: '4px 6px' } }, '会在会话里生成草稿，确认后回车才开跑'),
                 )
               : null,
@@ -1115,7 +1311,9 @@ window.__ModuleLoader__.load({
 
       function renderComments() {
         if (!comments) return h('div', { style: styles.empty }, '正在加载评论…')
-        if (comments.ok === false) return h('div', { style: styles.empty }, comments.error || '评论加载失败')
+        if (comments.ok === false) return h('div', { style: styles.empty },
+          h('div', { style: { color: C.error, marginBottom: 8 } }, comments.error || '评论加载失败'),
+          h('button', { type: 'button', style: styles.button, disabled: busy === 'detail', onClick: refreshDetail }, '重试加载评论'))
         const items = Array.isArray(comments.items) ? comments.items : []
         return h('div', null,
           items.length === 0 ? h('div', { style: { fontSize: 11, color: C.sub, padding: '8px 0' } }, '还没有评论') : null,
@@ -1152,7 +1350,7 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function dateFilterBar(list, range) {
+    function dateFilterBar(list, range, actions) {
       const preset = range ? range.preset : 'm3'
       const known = RANGE_PRESETS.some((item) => item.value === preset)
       const filter = list.filter
@@ -1163,7 +1361,7 @@ window.__ModuleLoader__.load({
         h('select', {
           style: { ...styles.input, height: 26, fontSize: 11 },
           value: preset,
-          onChange: (event) => changePreset(event.target.value),
+          onChange: (event) => actions.onPreset(event.target.value),
           'aria-label': '创建时间范围',
         },
           !known && /^m\d+$/.test(preset)
@@ -1175,7 +1373,7 @@ window.__ModuleLoader__.load({
           type: 'date',
           style: styles.dateInput,
           value: range ? range.since : '',
-          onChange: (event) => changeSince(event.target.value),
+          onChange: (event) => actions.onSince(event.target.value),
           'aria-label': '创建时间起始日期',
         }),
         h('span', null, '~'),
@@ -1183,9 +1381,22 @@ window.__ModuleLoader__.load({
           type: 'date',
           style: styles.dateInput,
           value: range ? range.until : '',
-          onChange: (event) => changeUntil(event.target.value),
+          onChange: (event) => actions.onUntil(event.target.value),
           'aria-label': '创建时间结束日期',
         }),
+        h('select', {
+          style: { ...styles.input, height: 26, fontSize: 11 },
+          value: actions.sort,
+          onChange: (event) => actions.onSort(event.target.value),
+          'aria-label': '任务排序',
+          title: '服务端按主工单排序并保持跨页顺序；接口附带的子任务仍随树形结果展示',
+        }, SORT_OPTIONS.map((item) => h('option', { key: item.value, value: item.value }, `排序：${item.label}`))),
+        h('button', {
+          type: 'button',
+          style: styles.buttonTiny,
+          onClick: actions.onClear,
+          title: '恢复当前项目的默认筛选、排序和时间范围',
+        }, '清除筛选'),
         h('div', { style: { flex: 1 } }),
         h('span', { style: { fontSize: 11 } },
           (filter && filter.selfOnly && filter.label ? `${filter.label} = 我 · ` : '') +

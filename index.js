@@ -64,6 +64,7 @@ function createRoutes({ store, client, imagePath }) {
     route(`${API}/status`, (request) => postStatus({ client }, request)),
     route(`${API}/comment`, (request) => postComment({ client }, request)),
     route(`${API}/dispatch`, (request) => postDispatch({ store, client }, request)),
+    route(`${API}/dispatch/confirm`, (request) => postDispatchConfirm({ store }, request)),
   ]
 }
 
@@ -249,6 +250,14 @@ async function getTasks({ store, client }, request) {
   const unfinished = boolParam(params, 'unfinished', true)
   const rawSince = String(params.get('since') || '').trim()
   const rawUntil = String(params.get('until') || '').trim()
+  const sortOptions = new Set([
+    'lastUpdateDate,desc',
+    'lastUpdateDate,asc',
+    'creationDate,desc',
+    'creationDate,asc',
+  ])
+  const requestedSort = String(params.get('sort') || 'lastUpdateDate,desc')
+  const sort = sortOptions.has(requestedSort) ? requestedSort : 'lastUpdateDate,desc'
   const project = settings.projects.find((item) => item.projectId === projectId) || {
     projectId,
     code: '',
@@ -315,7 +324,7 @@ async function getTasks({ store, client }, request) {
   const body = { treeFlag: true, withSubIssues: false }
   if (conditions.length > 0) body.conditions = conditions
 
-  const data = await client.workList(projectId, body, page, size)
+  const data = await client.workList(projectId, body, page, size, sort)
   const rows = Array.isArray(data?.content) ? data.content : []
   const total = Number(data?.totalElements ?? rows.length)
 
@@ -334,6 +343,7 @@ async function getTasks({ store, client }, request) {
     page,
     size,
     total,
+    sort,
     totalPages: Math.max(1, Number(data?.totalPages ?? Math.ceil(total / size) ?? 1)),
     filter: {
       selfOnly,
@@ -668,6 +678,23 @@ async function postComment({ client }, request) {
   return { ok: true }
 }
 
+async function postDispatchConfirm({ store }, request) {
+  const body = await readBody(request)
+  const settings = await store.load()
+  const projectId = String(body?.projectId || '')
+  if (!projectId) return { ok: false, error: '缺少 projectId' }
+  const directory = dispatchDirectory(settings, projectId)
+  await fs.mkdir(directory, { recursive: true })
+  return { ok: true, dir: directory }
+}
+
+function dispatchDirectory(settings, projectId) {
+  const project = settings.projects.find((item) => item.projectId === projectId) || { projectId, code: '' }
+  const safeCode = String(project.code || projectId).replace(/[^A-Za-z0-9._-]/g, '_')
+  const sessionRoot = String(settings.sessionRoot || '').trim() || path.join(os.homedir(), 'choerodon-sessions')
+  return path.join(sessionRoot, safeCode)
+}
+
 async function postDispatch({ store, client }, request) {
   const body = await readBody(request)
   const settings = await store.load()
@@ -709,12 +736,24 @@ async function postDispatch({ store, client }, request) {
     projectName: project.name || String(detail?.projectName ?? ''),
     projectCode: project.code || '',
   }
-  const { title, prompt } = buildBrief({ issue, kind, orgId: settings.organizationId, consoleUrl })
+  let comments = []
+  let commentsUnavailable = false
+  try {
+    const commentPage = await client.comments(projectId, issueId, 0, 10)
+    comments = Array.isArray(commentPage.items) ? commentPage.items : []
+  } catch {
+    commentsUnavailable = true
+  }
+  const { title, prompt } = buildBrief({
+    issue,
+    kind,
+    orgId: settings.organizationId,
+    consoleUrl,
+    comments,
+    commentsUnavailable,
+  })
 
-  const safeCode = String(project.code || projectId).replace(/[^A-Za-z0-9._-]/g, '_')
-  const sessionRoot = String(settings.sessionRoot || '').trim() || path.join(os.homedir(), 'choerodon-sessions')
-  const directory = path.join(sessionRoot, safeCode)
-  await fs.mkdir(directory, { recursive: true })
+  const directory = dispatchDirectory(settings, projectId)
 
   return { ok: true, kind, title, prompt, dir: directory, mode: settings.dispatchMode }
 }

@@ -37,7 +37,7 @@ const KIND_SKILLS = {
  * @param {object} input issue snapshot, dispatch kind, org id and console link
  * @returns {{title: string, prompt: string, kind: string}}
  */
-export function buildBrief({ issue, kind, orgId, consoleUrl }) {
+export function buildBrief({ issue, kind, orgId, consoleUrl, comments = [], commentsUnavailable = false }) {
   const normalizedKind = KIND_SKILLS[kind] ? kind : 'bug'
   const profile = KIND_SKILLS[normalizedKind]
   const description = htmlToText(issue.descriptionHtml, 4000)
@@ -58,6 +58,18 @@ export function buildBrief({ issue, kind, orgId, consoleUrl }) {
     lines.push('')
     lines.push('## 附件')
     for (const item of attachments) lines.push(`- ${item.fileName || '附件'}：${item.url}`)
+  }
+  lines.push('')
+  lines.push('## 最近评论（最多 10 条）')
+  if (commentsUnavailable) {
+    lines.push('（评论读取失败，必要时通过猪齿鱼查询补全。）')
+  } else if (comments.length === 0) {
+    lines.push('（暂无评论）')
+  } else {
+    for (const item of comments.slice(0, 10)) {
+      const text = htmlToText(String(item.text || ''), 1200)
+      lines.push(`- ${item.user || '未知'} · ${item.lastUpdateDate || '时间未知'}：${text || '（空评论）'}`)
+    }
   }
   lines.push('')
   lines.push(`## 处理目标：${KIND_LABELS[normalizedKind]}`)

@@ -351,11 +351,18 @@ export class ChoerodonClient {
 
   // ------------------------------------------------------------------ issues
 
-  async workList(projectId, body, page = 0, size = 20) {
-    return this.request(`/agile/v2/projects/${projectId}/issues/work_list?page=${page}&size=${size}`, {
-      method: 'POST',
-      body,
-    })
+  async workList(projectId, body, page = 0, size = 20, sort = 'lastUpdateDate,desc') {
+    const allowedSorts = new Set([
+      'lastUpdateDate,desc',
+      'lastUpdateDate,asc',
+      'creationDate,desc',
+      'creationDate,asc',
+    ])
+    const safeSort = allowedSorts.has(sort) ? sort : 'lastUpdateDate,desc'
+    return this.request(
+      `/agile/v2/projects/${projectId}/issues/work_list?page=${page}&size=${size}&sort=${encodeURIComponent(safeSort)}`,
+      { method: 'POST', body },
+    )
   }
 
   async baselineTotal(projectId) {
@@ -546,6 +553,7 @@ export function normalizeIssue(row, project) {
     statusId: String(row?.statusVO?.id ?? row?.statusMapVO?.id ?? ''),
     typeCode: String(row?.typeCode ?? ''),
     typeName: readName(row?.issueTypeVO),
+    parentId: String(row?.parentId ?? ''),
     priority: readName(row?.priorityVO),
     assignee: String(row?.assigneeRealName ?? row?.assigneeName ?? ''),
     reporter: String(row?.reporterRealName ?? row?.reporterName ?? ''),

@@ -102,7 +102,9 @@ window.__ModuleLoader__.load({
     const PROJECT_PREFS_KEY = 'choerodon-workbench:project-preferences:v1'
     const SELECTED_PROJECT_KEY = 'choerodon-workbench:selected-project'
     const DEFAULT_SORT = 'lastUpdateDate,desc'
-    const DISPATCH_LABELS = { fix: '数据修复', bug: 'Bug 排查', dev: '需求开发' }
+    const DISPATCH_LABELS = { fix: '数据修复', bug: 'Bug 排查', dev: '需求开发', design: '需求评审' }
+    const HANDOFF_ROLES = { product: '产品评审', engineering: '研发提测', testing: '测试结论', operations: '运维排障与上线验证' }
+    const HANDOFF_ROLE_KEY = 'choerodon-workbench:handoff-role:v1'
     const SORT_OPTIONS = [
       { value: 'lastUpdateDate,desc', label: '最近更新' },
       { value: 'lastUpdateDate,asc', label: '最久未更新' },
@@ -615,6 +617,18 @@ window.__ModuleLoader__.load({
       const [detailError, setDetailError] = React.useState('')
       const [tab, setTab] = React.useState('detail')
       const [comments, setComments] = React.useState(null)
+      const [handoffData, setHandoffData] = React.useState(null)
+      const [handoffReload, setHandoffReload] = React.useState(0)
+      const [handoffRole, setHandoffRole] = React.useState(() => {
+        try {
+          const saved = window.localStorage.getItem(HANDOFF_ROLE_KEY)
+          return Object.hasOwn(HANDOFF_ROLES, saved) ? saved : 'product'
+        } catch (error) {
+          return 'product'
+        }
+      })
+      const [handoffDraft, setHandoffDraft] = React.useState('')
+      const [handoffUncertain, setHandoffUncertain] = React.useState(false)
       const [commentDraft, setCommentDraft] = React.useState('')
       const [pendingTransform, setPendingTransform] = React.useState(null)
       const [busy, setBusy] = React.useState('')
@@ -783,6 +797,22 @@ window.__ModuleLoader__.load({
         }
       }, [selected, projectId, tick])
 
+      React.useEffect(() => {
+        if (tab !== 'handoffs' || !detail || !detail.issue || !projectId) return undefined
+        let cancelled = false
+        setHandoffData({ loading: true, items: [], totalComments: 0, scannedComments: 0, truncated: false })
+        apiGet('/handoffs', { projectId, issueId: detail.issue.issueId })
+          .then((result) => {
+            if (!cancelled) setHandoffData(result)
+          })
+          .catch((error) => {
+            if (!cancelled) setHandoffData({ ok: false, error: errorText(error), items: [] })
+          })
+        return () => {
+          cancelled = true
+        }
+      }, [tab, selectedId, projectId, tick, handoffReload])
+
       function refreshDetail() {
         setTick((value) => value + 1)
       }
@@ -836,6 +866,80 @@ window.__ModuleLoader__.load({
         } finally {
           setBusy('')
         }
+      }
+
+      function chooseHandoffRole(role) {
+        if (!Object.hasOwn(HANDOFF_ROLES, role) || role === handoffRole) return
+        if (handoffUncertain) {
+          setNotice({ tone: 'warn', text: '请先核实上次交接是否已发布，再切换角色或编辑草稿。' })
+          return
+        }
+        if (handoffDraft.trim()) {
+          setHandoffDraft('')
+          setNotice({ tone: 'warn', text: '角色已切换，已清空上一角色的草稿；请重新生成模板。' })
+        }
+        setHandoffRole(role)
+        try {
+          window.localStorage.setItem(HANDOFF_ROLE_KEY, role)
+        } catch (error) {
+          /* localStorage may be unavailable */
+        }
+      }
+
+      async function prepareHandoff() {
+        if (!detail || !detail.issue || handoffUncertain) return
+        setBusy('handoff-template')
+        try {
+          const result = await apiPost('/handoff/template', {
+            projectId,
+            issueId: detail.issue.issueId,
+            role: handoffRole,
+          })
+          setHandoffDraft(result.text || '')
+          setNotice({ tone: 'ok', text: `${result.title || HANDOFF_ROLES[handoffRole]}模板已生成，可编辑后发布` })
+        } catch (error) {
+          setNotice({ tone: 'error', text: `生成交接模板失败：${errorText(error)}` })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      async function publishHandoff() {
+        const text = handoffDraft.trim()
+        const expectedHeader = `【阶段交接 v1｜${HANDOFF_ROLES[handoffRole]}】`
+        if (!detail || !detail.issue || !text || handoffUncertain) return
+        if (!text.startsWith(expectedHeader)) {
+          setNotice({ tone: 'error', text: `交接草稿角色与当前所选「${HANDOFF_ROLES[handoffRole]}」不匹配。请重新生成模板后再发布。` })
+          return
+        }
+        setBusy('handoff-publish')
+        setHandoffUncertain(true)
+        try {
+          const result = await apiPost('/handoff', { projectId, issueId: detail.issue.issueId, text })
+          if (result.verified) {
+            setHandoffUncertain(false)
+            setNotice({ tone: 'ok', text: result.message || '交接记录已发布并回读核实' })
+            if (result.handoff) {
+              setHandoffData((current) => ({
+                ...(current || {}),
+                ok: true,
+                items: [result.handoff, ...((current && current.items) || []).filter((item) => item.commentId !== result.handoff.commentId)],
+              }))
+            }
+          } else {
+            setNotice({ tone: 'warn', text: result.message || '发布结果尚未核实；请检查猪齿鱼后再决定是否允许重试。' })
+          }
+        } catch (error) {
+          setNotice({ tone: 'error', text: `发布结果不确定：${errorText(error)}。请先检查猪齿鱼，避免重复提交。` })
+        } finally {
+          setBusy('')
+        }
+      }
+
+      function releaseHandoffRetry() {
+        if (!window.confirm('请先在猪齿鱼确认这条交接记录没有发布。确认后才会允许再次提交。')) return
+        setHandoffUncertain(false)
+        setNotice({ tone: 'warn', text: '已解除重复提交保护；发布前请再次确认评论中没有这条交接内容。' })
       }
 
       function applyRange(next) {
@@ -1142,7 +1246,7 @@ window.__ModuleLoader__.load({
           ? h('div', {
               role: 'dialog',
               'aria-modal': 'true',
-              'aria-label': '派发草稿预览',
+              'aria-label': dispatchKind === 'design' ? '需求评审预览' : '派发草稿预览',
               style: {
                 position: 'fixed', inset: 0, zIndex: 1000,
                 display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -1155,17 +1259,50 @@ window.__ModuleLoader__.load({
                 color: C.text, boxShadow: '0 18px 60px rgba(0,0,0,0.28)', overflow: 'hidden',
               } },
                 h('div', { style: { padding: '14px 18px', borderBottom: `1px solid ${C.border}` } },
-                  h('div', { style: { fontSize: 14, fontWeight: 650, marginBottom: 4 } }, `预览派发草稿 · ${DISPATCH_LABELS[dispatchKind] || '处理'}`),
-                  h('div', { style: { fontSize: 11, color: C.sub } }, `${dispatchPayload.title || ''} · 可在下方编辑本次指令`),
+                  h('div', { style: { fontSize: 14, fontWeight: 650, marginBottom: 4 } }, dispatchKind === 'design' ? '需求评审预览' : `预览派发草稿 · ${DISPATCH_LABELS[dispatchKind] || '处理'}`),
+                  h('div', { style: { fontSize: 11, color: C.sub } }, dispatchKind === 'design'
+                    ? `${dispatchPayload.title || ''} · 先讨论设计，再整理开发说明和验收标准；不会自动修改工单`
+                    : `${dispatchPayload.title || ''} · 可在下方编辑本次指令`),
                 ),
-                h('textarea', {
-                  style: { ...styles.textarea, flex: 1, minHeight: 240, margin: 14, width: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', lineHeight: '18px' },
-                  value: dispatchDraft,
-                  onChange: (event) => setDispatchDraft(event.target.value),
-                  'aria-label': '编辑 agent 派发指令',
-                }),
+                dispatchPayload.context
+                  ? h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, padding: '10px 18px 0', fontSize: 11, color: C.sub } },
+                      h('span', { style: styles.badge }, `描述：${!dispatchPayload.context.descriptionIncluded ? '为空' : dispatchPayload.context.descriptionTruncated ? `已截取前 ${dispatchPayload.context.descriptionLimit} 字` : '已读取'}`),
+                      h('span', { style: styles.badge }, dispatchPayload.context.commentsUnavailable
+                        ? '评论：读取失败'
+                        : `评论：已读 ${dispatchPayload.context.commentsIncluded}/${dispatchPayload.context.commentsTotal ?? dispatchPayload.context.commentsIncluded} 条（最多${dispatchPayload.context.commentLimit}条）${dispatchPayload.context.commentsTruncatedCount > 0 ? `；${dispatchPayload.context.commentsTruncatedCount}条内容已截断` : ''}`),
+                      h('span', { style: styles.badge }, dispatchPayload.context.attachmentCount > 0
+                        ? `附件：${dispatchPayload.context.attachmentCount} 个链接（未读取内容）`
+                        : '附件：无'),
+                      h('span', { style: styles.badge }, dispatchPayload.context.handoffsUnavailable
+                        ? '交接记录：读取失败'
+                        : `交接记录：读取 ${dispatchPayload.context.handoffCount} 条，带入 ${dispatchPayload.context.handoffContextIncludedCount} 条${dispatchPayload.context.handoffContextOmittedCount ? `，另有 ${dispatchPayload.context.handoffContextOmittedCount} 条未带入` : ''}${dispatchPayload.context.handoffSourceTruncatedCount ? `；${dispatchPayload.context.handoffSourceTruncatedCount} 条原评论已截断` : ''}${dispatchPayload.context.handoffsTruncated ? '；历史扫描不完整' : ''}`),
+                      h('span', { style: styles.badge }, `快照：${dispatchPayload.context.snapshotAt ? new Date(dispatchPayload.context.snapshotAt).toLocaleString() : '刚刚'}`),
+                    )
+                  : null,
+                dispatchKind === 'design'
+                  ? h('div', { style: { margin: 14, padding: 14, border: `1px solid ${C.border}`, borderRadius: 8, lineHeight: '18px', fontSize: 12 } },
+                      h('div', { style: { fontWeight: 650, marginBottom: 6 } }, 'AI 会做什么'),
+                      h('div', { style: { color: C.sub } }, '先复述需求理解和方案优点，再指出有依据的歧义、冲突、遗漏和改进选项。优先讨论最可能阻塞开发的问题；你补充或选择后，AI 再整理成需求描述草稿、验收标准和未解决事项。'),
+                      h('details', { style: { marginTop: 10 } },
+                        h('summary', { style: { cursor: 'pointer', color: C.brand } }, '查看或编辑完整评审指令'),
+                        h('textarea', {
+                          style: { ...styles.textarea, minHeight: 180, marginTop: 8, width: '100%', boxSizing: 'border-box', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', lineHeight: '18px' },
+                          value: dispatchDraft,
+                          onChange: (event) => setDispatchDraft(event.target.value),
+                          'aria-label': '查看或编辑需求评审指令',
+                        }),
+                      ),
+                    )
+                  : h('textarea', {
+                      style: { ...styles.textarea, flex: 1, minHeight: 240, margin: 14, width: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', lineHeight: '18px' },
+                      value: dispatchDraft,
+                      onChange: (event) => setDispatchDraft(event.target.value),
+                      'aria-label': '编辑 agent 派发指令',
+                    }),
                 h('div', { style: { padding: '0 18px 12px', color: C.warn, fontSize: 11, lineHeight: '16px' } },
-                  '确认后会新建会话，并替换该会话当前未提交的草稿；agent 只有在你进入会话并按回车后才开始执行。'),
+                  dispatchKind === 'design'
+                    ? '确认后只创建需求评审会话草稿，不会写入评论或修改描述；进入会话后按回车才开始讨论。'
+                    : '确认后会新建会话，并替换该会话当前未提交的草稿；agent 只有在你进入会话并按回车后才开始执行。'),
                 h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '12px 18px', borderTop: `1px solid ${C.border}` } },
                   h('button', { type: 'button', style: styles.button, disabled: busy === 'dispatch', onClick: () => setDispatchPayload(null) }, '取消'),
                   h('button', { type: 'button', style: styles.buttonPrimary, disabled: busy === 'dispatch' || !dispatchDraft.trim(), onClick: confirmDispatch },
@@ -1255,7 +1392,7 @@ window.__ModuleLoader__.load({
                     zIndex: 20,
                     top: 32,
                     left: 0,
-                    minWidth: 180,
+                    minWidth: 216,
                     padding: 6,
                     borderRadius: 8,
                     border: `1px solid ${C.border}`,
@@ -1268,6 +1405,13 @@ window.__ModuleLoader__.load({
                 },
                   h('button', { type: 'button', style: { ...styles.button, textAlign: 'left', border: 'none' }, onClick: () => prepareDispatch('fix') }, '数据修复'),
                   h('button', { type: 'button', style: { ...styles.button, textAlign: 'left', border: 'none' }, onClick: () => prepareDispatch('bug') }, 'Bug 排查'),
+                  h('button', {
+                    type: 'button',
+                    style: { ...styles.button, textAlign: 'left', border: 'none', display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 2 },
+                    onClick: () => prepareDispatch('design'),
+                  },
+                    h('span', null, '去设计'),
+                    h('span', { style: { fontSize: 10, color: C.sub, fontWeight: 400 } }, '评审方案并补齐开发信息')),
                   h('button', { type: 'button', style: { ...styles.button, textAlign: 'left', border: 'none' }, onClick: () => prepareDispatch('dev') }, '需求开发'),
                   h('div', { style: { fontSize: 10, color: C.sub, padding: '4px 6px' } }, '会在会话里生成草稿，确认后回车才开跑'),
                 )
@@ -1279,6 +1423,7 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', style: tab === 'detail' ? styles.buttonPrimary : styles.button, onClick: () => setTab('detail') }, '描述'),
             h('button', { type: 'button', style: tab === 'comments' ? styles.buttonPrimary : styles.button, onClick: () => setTab('comments') },
               `评论 ${comments && comments.ok ? comments.total : ''}`.trim()),
+            h('button', { type: 'button', style: tab === 'handoffs' ? styles.buttonPrimary : styles.button, onClick: () => setTab('handoffs') }, '协作记录'),
           ),
 
           tab === 'detail'
@@ -1305,7 +1450,60 @@ window.__ModuleLoader__.load({
                     )
                   : null,
               )
-            : renderComments(),
+            : tab === 'comments' ? renderComments() : renderHandoffs(),
+        )
+      }
+
+      function renderHandoffs() {
+        const data = handoffData
+        const items = data && Array.isArray(data.items) ? data.items : []
+        return h('div', null,
+          h('div', { style: { ...styles.row, alignItems: 'center', flexWrap: 'wrap', marginBottom: 8 } },
+            h('select', {
+              style: styles.input,
+              value: handoffRole,
+              disabled: handoffUncertain,
+              onChange: (event) => chooseHandoffRole(event.target.value),
+              'aria-label': '交接记录角色',
+            }, Object.entries(HANDOFF_ROLES).map(([key, label]) => h('option', { key, value: key }, label))),
+            h('button', { type: 'button', style: styles.button, disabled: busy === 'handoff-template' || handoffUncertain, onClick: prepareHandoff },
+              busy === 'handoff-template' ? '生成中…' : '生成交接模板'),
+            h('button', { type: 'button', style: styles.buttonTiny, disabled: Boolean(data && data.loading), onClick: () => setHandoffReload((value) => value + 1) }, '刷新记录'),
+          ),
+          h('div', { style: { fontSize: 11, color: C.sub, marginBottom: 10 } }, '团队共享记录保存在猪齿鱼评论中；切换角色会清空当前草稿。发布只会在点击下方按钮后发生。'),
+          data && data.loading ? h('div', { style: styles.empty }, '正在读取共享交接记录…') : null,
+          data && data.ok === false ? h('div', { style: styles.notice('error') }, `读取交接记录失败：${data.error || '未知错误'}`) : null,
+          data && data.ok && data.truncated ? h('div', { style: styles.notice('warn'), role: 'status' }, `扫描到 ${data.scannedComments}/${data.totalComments} 条评论；历史可能更长，较早的交接记录可能未读取。`) : null,
+          data && data.ok && !data.truncated ? h('div', { style: { fontSize: 11, color: C.sub, marginBottom: 8 } }, `已扫描 ${data.scannedComments} 条评论，发现 ${items.length} 条交接记录。`) : null,
+          handoffUncertain ? h('div', { style: { ...styles.notice('warn'), marginBottom: 8 }, role: 'alert' },
+            h('span', null, '上次发布结果尚未核实。先到猪齿鱼检查评论；确认没有发布后，再解除保护。'),
+            h('button', { type: 'button', style: styles.buttonTiny, onClick: releaseHandoffRetry }, '确认未发布，允许重试')) : null,
+          h('div', { style: { border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, margin: '10px 0' } },
+            h('div', { style: styles.sectionTitle }, '交接草稿'),
+            h('textarea', {
+              style: { ...styles.textarea, minHeight: 220, width: '100%', boxSizing: 'border-box', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
+              value: handoffDraft,
+              disabled: handoffUncertain,
+              onChange: (event) => setHandoffDraft(event.target.value),
+              placeholder: '生成模板后填写交接内容；保留首行角色标记以便其他角色识别。',
+              'aria-label': '编辑交接记录草稿',
+            }),
+            h('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 6 } },
+              h('button', {
+                type: 'button',
+                style: styles.buttonPrimary,
+                disabled: busy === 'handoff-publish' || handoffUncertain || !handoffDraft.trim().startsWith(`【阶段交接 v1｜${HANDOFF_ROLES[handoffRole]}】`),
+                onClick: publishHandoff,
+              }, busy === 'handoff-publish' ? '发布并核实中…' : '发布交接记录')),
+          ),
+          h('div', { style: styles.sectionTitle }, `近期共享交接 ${items.length}`),
+          items.length === 0 && data && data.ok ? h('div', { style: { fontSize: 11, color: C.sub, padding: '8px 0' } }, '当前扫描范围内没有带角色标记的交接评论。') : null,
+          items.map((item) => h('div', { key: item.commentId, style: { ...styles.comment, marginBottom: 8 } },
+            h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, marginBottom: 5 } },
+              h('strong', null, item.stage || '阶段交接'),
+              h('span', { style: { fontSize: 10, color: C.sub } }, `${item.user || '未知'} · ${formatTime(item.lastUpdateDate)}`)),
+            item.truncated ? h('div', { style: { ...styles.notice('warn'), marginBottom: 5 } }, '原评论超过读取上限，以下内容不完整；请打开猪齿鱼原评论查看剩余部分。') : null,
+            h('div', { style: { fontSize: 11, lineHeight: '17px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, item.text))),
         )
       }
 

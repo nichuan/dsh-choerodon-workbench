@@ -15,6 +15,7 @@ import {
 import { buildBrief, DISPATCH_KINDS, KIND_LABELS } from './src/brief.js'
 import { IMAGE_PREFIX, imageProxyPath, sanitizeRichText } from './src/html.js'
 import { attachmentsOf, detailUrl, htmlToText } from './src/text.js'
+import { buildHandoffTemplate, HANDOFF_ROLES, isHandoffComment, normalizeHandoffText, parseHandoffComment } from './src/handoff.js'
 
 const API = '/api/choerodon'
 
@@ -61,8 +62,11 @@ function createRoutes({ store, client, imagePath }) {
     route(`${API}/tasks`, (request) => getTasks({ store, client }, request)),
     route(`${API}/issue`, (request) => getIssue({ store, client, imagePath }, request)),
     route(`${API}/comments`, (request) => getComments({ client, imagePath }, request)),
+    route(`${API}/handoffs`, (request) => getHandoffs({ client }, request)),
+    route(`${API}/handoff/template`, (request) => postHandoffTemplate({ store, client }, request)),
     route(`${API}/status`, (request) => postStatus({ client }, request)),
     route(`${API}/comment`, (request) => postComment({ client }, request)),
+    route(`${API}/handoff`, (request) => postHandoff({ client }, request)),
     route(`${API}/dispatch`, (request) => postDispatch({ store, client }, request)),
     route(`${API}/dispatch/confirm`, (request) => postDispatchConfirm({ store }, request)),
   ]
@@ -439,6 +443,41 @@ async function getComments({ client, imagePath }, request) {
   }
 }
 
+const HANDOFF_PAGE_SIZE = 50
+const HANDOFF_MAX_PAGES = 6
+
+async function readHandoffs(client, projectId, issueId) {
+  const items = []
+  let total = 0
+  let scanned = 0
+  for (let page = 0; page < HANDOFF_MAX_PAGES; page += 1) {
+    const result = await client.comments(projectId, issueId, page, HANDOFF_PAGE_SIZE)
+    const comments = Array.isArray(result.items) ? result.items : []
+    total = Number(result.total || 0)
+    scanned += comments.length
+    for (const comment of comments) {
+      const handoff = parseHandoffComment(comment)
+      if (handoff) items.push(handoff)
+    }
+    if (comments.length === 0 || scanned >= total) break
+  }
+  return {
+    items,
+    totalComments: total,
+    scannedComments: scanned,
+    truncated: scanned < total,
+    snapshotAt: new Date().toISOString(),
+  }
+}
+
+async function getHandoffs({ client }, request) {
+  const params = paramsOf(request)
+  const projectId = String(params.get('projectId') || '')
+  const issueId = String(params.get('issueId') || '')
+  if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
+  return { ok: true, ...(await readHandoffs(client, projectId, issueId)) }
+}
+
 // ---------------------------------------------------------------- rich media
 
 const UA =
@@ -678,6 +717,54 @@ async function postComment({ client }, request) {
   return { ok: true }
 }
 
+async function postHandoffTemplate({ store, client }, request) {
+  const body = await readBody(request)
+  const projectId = String(body?.projectId || '')
+  const issueId = String(body?.issueId || '')
+  const role = String(body?.role || '')
+  if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
+  if (!HANDOFF_ROLES[role]) return { ok: false, error: '请选择有效的交接角色' }
+  const [settings, detail] = await Promise.all([store.load(), client.issueDetail(projectId, issueId)])
+  const project = settings.projects.find((item) => item.projectId === projectId) || {}
+  const issue = {
+    issueNum: String(detail?.issueNum || ''),
+    summary: String(detail?.summary || ''),
+    projectId,
+    projectCode: String(project.code || ''),
+    projectName: String(project.name || detail?.projectName || ''),
+  }
+  return { ok: true, role, title: HANDOFF_ROLES[role].label, text: buildHandoffTemplate(role, issue) }
+}
+
+async function postHandoff({ client }, request) {
+  const body = await readBody(request)
+  const projectId = String(body?.projectId || '')
+  const issueId = String(body?.issueId || '')
+  const text = String(body?.text || '').trim()
+  if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
+  if (!text || !isHandoffComment({ text })) return { ok: false, error: '交接内容必须以「【阶段交接 v1｜角色】」开头' }
+
+  await client.addComment(projectId, issueId, text)
+  try {
+    const latest = await client.comments(projectId, issueId, 0, HANDOFF_PAGE_SIZE)
+    const wanted = normalizeHandoffText(text)
+    const match = latest.items.find((item) => normalizeHandoffText(item.text) === wanted)
+    return {
+      ok: true,
+      verified: Boolean(match),
+      handoff: match ? parseHandoffComment(match) : null,
+      message: match ? '交接记录已发布并回读核实' : '发布请求已成功返回，但暂未在最新评论中匹配到记录；请刷新查看，避免重复提交',
+    }
+  } catch (error) {
+    return {
+      ok: true,
+      verified: false,
+      handoff: null,
+      message: `发布请求已成功返回，但回读失败：${error?.message || String(error)}。请刷新查看，避免重复提交`,
+    }
+  }
+}
+
 async function postDispatchConfirm({ store }, request) {
   const body = await readBody(request)
   const settings = await store.load()
@@ -736,13 +823,27 @@ async function postDispatch({ store, client }, request) {
     projectName: project.name || String(detail?.projectName ?? ''),
     projectCode: project.code || '',
   }
+  const commentLimit = kind === 'design' ? 20 : 10
+  const descriptionLimit = kind === 'design' ? 8000 : 4000
   let comments = []
+  let commentsTotal = null
   let commentsUnavailable = false
   try {
-    const commentPage = await client.comments(projectId, issueId, 0, 10)
+    const commentPage = await client.comments(projectId, issueId, 0, commentLimit)
     comments = Array.isArray(commentPage.items) ? commentPage.items : []
+    commentsTotal = Number.isFinite(Number(commentPage.total)) ? Number(commentPage.total) : comments.length
   } catch {
     commentsUnavailable = true
+  }
+  let handoffs = []
+  let handoffsTruncated = false
+  let handoffsUnavailable = false
+  try {
+    const handoffData = await readHandoffs(client, projectId, issueId)
+    handoffs = handoffData.items
+    handoffsTruncated = handoffData.truncated
+  } catch {
+    handoffsUnavailable = true
   }
   const { title, prompt } = buildBrief({
     issue,
@@ -751,9 +852,39 @@ async function postDispatch({ store, client }, request) {
     consoleUrl,
     comments,
     commentsUnavailable,
+    commentLimit,
+    descriptionLimit,
+    handoffs,
+    handoffsTruncated,
+    handoffsUnavailable,
   })
 
   const directory = dispatchDirectory(settings, projectId)
 
-  return { ok: true, kind, title, prompt, dir: directory, mode: settings.dispatchMode }
+  return {
+    ok: true,
+    kind,
+    title,
+    prompt,
+    dir: directory,
+    mode: settings.dispatchMode,
+    context: {
+      descriptionIncluded: Boolean(htmlToText(String(detail?.description ?? ''), descriptionLimit).trim()),
+      descriptionTruncated: htmlToText(String(detail?.description ?? ''), descriptionLimit).endsWith('…（内容已截断）'),
+      descriptionLimit,
+      commentsIncluded: comments.length,
+      commentsTotal,
+      commentsUnavailable,
+      commentLimit,
+      commentsTruncatedCount: comments.filter((item) => htmlToText(String(item.text || ''), 1200).endsWith('…（内容已截断）')).length,
+      attachmentCount: issue.attachments.length,
+      handoffCount: handoffs.length,
+      handoffContextIncludedCount: Math.min(handoffs.length, 8),
+      handoffContextOmittedCount: Math.max(0, handoffs.length - 8),
+      handoffSourceTruncatedCount: handoffs.filter((item) => item.truncated).length,
+      handoffsTruncated,
+      handoffsUnavailable,
+      snapshotAt: new Date().toISOString(),
+    },
+  }
 }

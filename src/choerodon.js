@@ -73,7 +73,7 @@ export class ChoerodonClient {
   }
 
   base() {
-    return String(this.getSettings().baseUrl || '').replace(/\/+$/, '')
+    return String(this.getSettings().baseUrl || '').trim().replace(/\/+$/, '')
   }
 
   orgId() {
@@ -163,7 +163,14 @@ export class ChoerodonClient {
     const html = await page.text()
     const match = /data-publicKey="([^"]+)"/.exec(html)
     if (!match || !match[1]) {
-      throw new Error('登录失败：登录页没有 RSA 公钥，请检查网关地址')
+      const snippet = html.replace(/\s+/g, ' ').trim().slice(0, 200)
+      const hint =
+        page.status !== 200
+          ? `HTTP ${page.status}（可能被网关或公司代理重定向/拦截）`
+          : 'HTTP 200 但页面异常（可能当前网络走了公司代理、WAF 或内网 DNS，返回了别的页面）'
+      throw new Error(
+        `登录失败：登录页没有 RSA 公钥（${hint}）。返回内容片段：${snippet || '(空响应)'}`
+      )
     }
     let cookies = cookieMap(page)
 

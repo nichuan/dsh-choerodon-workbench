@@ -437,6 +437,9 @@ window.__ModuleLoader__.load({
       '.cw-img-error{display:inline-block;font-size:11px;line-height:16px;color:var(--dsw-alias-label-secondary);border:1px dashed var(--dsw-alias-border-l1);border-radius:6px;padding:6px 10px;margin:4px 0;}',
     ].join('\n')
 
+    // Follow the host frame's native leading inset while the macOS sidebar is collapsed.
+    const LAYOUT_CSS = 'html[data-platform="darwin"] [data-sidebar-collapsed] .cw-workbench-toolbar{padding-left:var(--dsh-frame-leading-clearance,96px)!important;}'
+
     // Rich text payloads render through the browser, but their screenshots are
     // fetched as blobs: an <img> request and a fetch differ in admission, and a
     // failed fetch can report its HTTP status instead of a broken image icon.
@@ -1070,10 +1073,10 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { style: styles.page },
-        h('style', { key: 'cw-prose-style' }, PROSE_CSS),
+        h('style', { key: 'cw-prose-style' }, `${PROSE_CSS}\n${LAYOUT_CSS}`),
         h(
           'div',
-          { style: styles.toolbar },
+          { className: 'cw-workbench-toolbar', style: styles.toolbar },
           h('select', {
             style: { ...styles.input, minWidth: 190 },
             value: projectId,

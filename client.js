@@ -103,8 +103,13 @@ window.__ModuleLoader__.load({
     const SELECTED_PROJECT_KEY = 'choerodon-workbench:selected-project'
     const DEFAULT_SORT = 'lastUpdateDate,desc'
     const DISPATCH_LABELS = { fix: '数据修复', bug: 'Bug 排查', dev: '需求开发', design: '需求评审' }
-    const HANDOFF_ROLES = { product: '产品评审', engineering: '研发提测', testing: '测试结论', operations: '运维排障与上线验证' }
-    const HANDOFF_ROLE_KEY = 'choerodon-workbench:handoff-role:v1'
+    const HANDOFF_ROLE_KEY = 'choerodon-workbench:handoff-role'
+    const HANDOFF_ROLES = {
+      product: '产品评审',
+      engineering: '研发提测',
+      testing: '测试结论',
+      operations: '运维排障与上线验证',
+    }
     const SORT_OPTIONS = [
       { value: 'lastUpdateDate,desc', label: '最近更新' },
       { value: 'lastUpdateDate,asc', label: '最久未更新' },
@@ -126,17 +131,34 @@ window.__ModuleLoader__.load({
     }
 
     /** Subtract calendar months, clamping month-end overflow (May 31 - 3m => Feb 28). */
-    function monthsAgo(months) {
-      const now = new Date()
+    function monthsAgo(months, now = new Date()) {
       const wantedMonth = ((now.getMonth() - months) % 12 + 12) % 12
       const result = new Date(now.getFullYear(), now.getMonth() - months, now.getDate())
       if (result.getMonth() !== wantedMonth) result.setDate(0)
       return result
     }
 
-    function presetRange(months) {
+    function presetRange(months, now = new Date()) {
       if (!months || months <= 0) return { since: '', until: '', preset: 'all' }
-      return { since: fmtDate(monthsAgo(months)), until: fmtDate(new Date()), preset: `m${months}` }
+      return { since: fmtDate(monthsAgo(months, now)), until: fmtDate(now), preset: `m${months}` }
+    }
+
+    function presetMonths(range) {
+      const match = /^m(\d+)$/.exec(range?.preset || '')
+      const months = Number(match?.[1])
+      return months > 0 && months <= 120 ? months : 0
+    }
+
+    function restoreRange(saved) {
+      if (!saved || typeof saved !== 'object') return null
+      if (saved.preset === 'all') return presetRange(0)
+      const months = presetMonths(saved)
+      if (months) return presetRange(months)
+      const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))
+      if (validDate(saved.since) && validDate(saved.until)) {
+        return { since: saved.since, until: saved.until, preset: 'custom' }
+      }
+      return null
     }
 
     function defaultRange(months) {
@@ -146,14 +168,7 @@ window.__ModuleLoader__.load({
 
     function readSavedRange() {
       try {
-        const raw = window.localStorage.getItem(RANGE_KEY)
-        if (!raw) return null
-        const saved = JSON.parse(raw)
-        const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))
-        if (saved && typeof saved === 'object' && validDate(saved.since) && validDate(saved.until)) {
-          return { since: saved.since, until: saved.until, preset: String(saved.preset || 'custom') }
-        }
-        if (saved && saved.preset === 'all') return { since: '', until: '', preset: 'all' }
+        return restoreRange(JSON.parse(window.localStorage.getItem(RANGE_KEY) || 'null'))
       } catch (error) {
         /* localStorage may be unavailable */
       }
@@ -166,16 +181,10 @@ window.__ModuleLoader__.load({
         const all = JSON.parse(window.localStorage.getItem(PROJECT_PREFS_KEY) || '{}')
         const saved = all && all[String(projectId)]
         if (!saved || typeof saved !== 'object') return null
-        const range = saved.range && typeof saved.range === 'object' ? saved.range : null
-        if (range) {
-          const validDate = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))
-          if (range.preset === 'all') saved.range = { since: '', until: '', preset: 'all' }
-          else if (!validDate(range.since) || !validDate(range.until)) saved.range = null
-        }
         return {
           selfOnly: typeof saved.selfOnly === 'boolean' ? saved.selfOnly : true,
           unfinished: typeof saved.unfinished === 'boolean' ? saved.unfinished : true,
-          range: saved.range || null,
+          range: restoreRange(saved.range),
           sort: SORT_OPTIONS.some((item) => item.value === saved.sort) ? saved.sort : DEFAULT_SORT,
         }
       } catch (error) {
@@ -187,7 +196,8 @@ window.__ModuleLoader__.load({
       if (!projectId) return
       try {
         const all = JSON.parse(window.localStorage.getItem(PROJECT_PREFS_KEY) || '{}')
-        all[String(projectId)] = prefs
+        const range = prefs.range
+        all[String(projectId)] = { ...prefs, range: range && range.preset !== 'custom' ? { preset: range.preset } : range }
         window.localStorage.setItem(PROJECT_PREFS_KEY, JSON.stringify(all))
       } catch (error) {
         /* localStorage may be unavailable */
@@ -210,10 +220,51 @@ window.__ModuleLoader__.load({
       }
     }
 
+    function readHandoffRole() {
+      try {
+        const role = window.localStorage.getItem(HANDOFF_ROLE_KEY) || ''
+        return Object.hasOwn(HANDOFF_ROLES, role) ? role : 'product'
+      } catch (error) {
+        return 'product'
+      }
+    }
+
+    function saveHandoffRole(role) {
+      try {
+        if (Object.hasOwn(HANDOFF_ROLES, role)) window.localStorage.setItem(HANDOFF_ROLE_KEY, role)
+      } catch (error) {
+        /* localStorage may be unavailable */
+      }
+    }
+
     function rangeLabel(range) {
       if (!range || range.preset === 'all' || !range.since) return '全部时间'
       return `${range.since} ~ ${range.until}`
     }
+
+    function issueNumber(value) {
+      const input = String(value || '').trim()
+      const normalize = (text) => /^[A-Za-z][A-Za-z0-9_-]*-\d+$/.test(text || '') ? text.toUpperCase() : ''
+      const direct = normalize(input)
+      if (direct) return direct
+      try {
+        const url = new URL(input)
+        if (!['http:', 'https:'].includes(url.protocol)) return ''
+        const [hashPath, hashQuery] = url.hash.slice(1).split('?')
+        for (const params of [new URLSearchParams(hashQuery), url.searchParams]) {
+          for (const key of ['paramName', 'issueNum']) {
+            const result = normalize(params.get(key))
+            if (result) return result
+          }
+        }
+        return normalize(hashPath.split('/').filter(Boolean).at(-1)) ||
+          normalize(url.pathname.split('/').filter(Boolean).at(-1))
+      } catch {
+        return ''
+      }
+    }
+
+    const issueKey = ({ projectId, issueId }) => JSON.stringify([projectId, issueId])
 
     // --------------------------------------------------------------- styles
 
@@ -440,11 +491,6 @@ window.__ModuleLoader__.load({
     // Follow the host frame's native leading inset while the macOS sidebar is collapsed.
     const LAYOUT_CSS = 'html[data-platform="darwin"] [data-sidebar-collapsed] .cw-workbench-toolbar{padding-left:var(--dsh-frame-leading-clearance,96px)!important;}'
 
-    // Rich text payloads render through the browser, but their screenshots are
-    // fetched as blobs: an <img> request and a fetch differ in admission, and a
-    // failed fetch can report its HTTP status instead of a broken image icon.
-    const resolvedImages = new Map()
-
     function escapeHtml(value) {
       return String(value == null ? '' : value)
         .replace(/&/g, '&amp;')
@@ -453,66 +499,59 @@ window.__ModuleLoader__.load({
         .replace(/"/g, '&quot;')
     }
 
-    function resolveImage(src) {
-      if (!resolvedImages.has(src)) {
-        resolvedImages.set(
-          src,
-          (async () => {
-            try {
-              const response = await fetch(src, { credentials: 'same-origin', cache: 'force-cache' })
-              if (!response.ok) return { error: `HTTP ${response.status}` }
-              const type = response.headers.get('content-type') || ''
-              if (!/^image\//i.test(type)) return { error: type || '返回的不是图片' }
-              return { url: URL.createObjectURL(await response.blob()) }
-            } catch (error) {
-              return { error: errorText(error) }
-            }
-          })(),
-        )
-      }
-      return resolvedImages.get(src)
-    }
-
     function useRichHtml(html) {
-      const [rendered, setRendered] = React.useState(html || '')
+      const [rendered, setRendered] = React.useState(null)
       React.useEffect(() => {
-        let cancelled = false
-        if (!html) {
-          setRendered('')
-          return undefined
+        const tags = html?.match(/<img\b[^>]*>/gi) || []
+        if (!tags.length) return undefined
+        const controller = new AbortController()
+        const requests = new Map()
+        const objectUrls = []
+
+        async function resolveImage(src) {
+          try {
+            const response = await fetch(src, {
+              credentials: 'same-origin',
+              cache: 'no-store',
+              signal: controller.signal,
+            })
+            if (!response.ok) return { error: `HTTP ${response.status}` }
+            const type = response.headers.get('content-type') || ''
+            if (!/^image\//i.test(type)) return { error: type || '返回的不是图片' }
+            const blob = await response.blob()
+            if (controller.signal.aborted) return {}
+            const url = URL.createObjectURL(blob)
+            objectUrls.push(url)
+            return { url }
+          } catch (error) {
+            return { error: errorText(error) }
+          }
         }
-        const tags = Array.from(html.matchAll(/<img\b[^>]*>/gi), (match) => match[0])
-        if (tags.length === 0) {
-          setRendered(html)
-          return undefined
-        }
-        setRendered(html)
+
         Promise.all(
           tags.map(async (tag) => {
             const source = /src="([^"]*)"/i.exec(tag)
-            if (!source) return { tag, replacement: '<span class="cw-img-error">图片缺少地址</span>' }
-            const result = await resolveImage(source[1].replace(/&amp;/g, '&'))
+            if (!source) return [tag, '<span class="cw-img-error">图片缺少地址</span>']
+            const src = source[1].replace(/&amp;/g, '&')
+            if (!requests.has(src)) requests.set(src, resolveImage(src))
+            const result = await requests.get(src)
             if (result.url) {
-              return { tag, replacement: tag.replace(/src="[^"]*"/i, `src="${result.url}"`) }
+              return [tag, tag.replace(/src="[^"]*"/i, `src="${result.url}"`)]
             }
-            return {
-              tag,
-              replacement: `<span class="cw-img-error">图片加载失败（${escapeHtml(result.error)}）</span>`,
-            }
+            return [tag, `<span class="cw-img-error">图片加载失败（${escapeHtml(result.error)}）</span>`]
           }),
-        )
-          .then((items) => {
-            if (cancelled) return
-            let next = html
-            for (const item of items) next = next.split(item.tag).join(item.replacement)
-            setRendered(next)
-          })
-          .catch(() => {})
+        ).then((items) => {
+          if (controller.signal.aborted) return
+          const replacements = new Map(items)
+          setRendered({ source: html, output: html.replace(/<img\b[^>]*>/gi, (tag) => replacements.get(tag)) })
+        })
         return () => {
-          cancelled = true
+          controller.abort()
+          for (const url of objectUrls) URL.revokeObjectURL(url)
         }
       }, [html])
-      return rendered
+      return rendered?.source === html ? rendered.output
+        : String(html || '').replace(/<img\b[^>]*>/gi, '<span class="cw-img-error">正在加载图片…</span>')
     }
 
     function CommentBody(props) {
@@ -568,6 +607,9 @@ window.__ModuleLoader__.load({
       if (!notice) return null
       return h('div', { style: { ...styles.notice(notice.tone), display: 'flex', alignItems: 'center', gap: 10 } },
         h('span', { style: { flex: 1, minWidth: 0 } }, notice.text),
+        notice.prompt
+          ? h('button', { type: 'button', style: styles.buttonTiny, onClick: () => copyText(notice.prompt) }, '复制本次指令')
+          : null,
         notice.path
           ? h('button', { type: 'button', style: styles.buttonTiny, onClick: () => copyText(notice.path) }, '复制会话路径')
           : null,
@@ -579,24 +621,23 @@ window.__ModuleLoader__.load({
 
     // ---------------------------------------------------------- dispatch glue
 
-    async function startDispatch(payload) {
+    async function startDispatch(payload, isCurrent) {
       const workspaces = service('workspaces')
       const uiWorkspace = service('uiWorkspace')
-      let workspaceId = undefined
-      if (workspaces && typeof workspaces.create === 'function') {
-        const created = await workspaces.create({ path: payload.dir })
-        workspaceId =
-          created && created.workspace ? created.workspace.workspaceId : created ? created.workspaceId : undefined
+      if (typeof workspaces?.create !== 'function' || typeof uiWorkspace?.startSession !== 'function') {
+        throw new Error('会话服务不可用，无法新建会话')
       }
-      if (uiWorkspace && typeof uiWorkspace.startSession === 'function') {
-        uiWorkspace.startSession(workspaceId, { prompt: payload.prompt, whenDraftExists: 'replace' })
-        return {
-          tone: 'ok',
-          text: `已为 ${payload.title} 创建会话草稿。请在会话中检查内容，确认后按回车开始。`,
-          path: payload.dir,
-        }
+      const created = await workspaces.create({ path: payload.dir })
+      if (!isCurrent()) return null
+      const workspaceId = created?.workspace?.workspaceId ?? created?.workspaceId
+      if (!workspaceId) throw new Error('会话服务没有返回目标工作区')
+      uiWorkspace.startSession(workspaceId, { prompt: payload.prompt, whenDraftExists: 'keep' })
+      return {
+        tone: 'ok',
+        text: `已请求打开 ${payload.title} 的会话。已有草稿会保留；可复制本次指令，检查内容后按回车。`,
+        path: payload.dir,
+        prompt: payload.prompt,
       }
-      throw new Error('会话服务不可用，无法新建会话')
     }
 
     // ------------------------------------------------------------ main panel
@@ -615,30 +656,14 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = React.useState(false)
       const [listError, setListError] = React.useState('')
       const [tick, setTick] = React.useState(0)
-      const [selectedId, setSelectedId] = React.useState('')
-      const [detail, setDetail] = React.useState(null)
-      const [detailState, setDetailState] = React.useState('idle')
-      const [detailError, setDetailError] = React.useState('')
-      const [tab, setTab] = React.useState('detail')
-      const [comments, setComments] = React.useState(null)
-      const [handoffData, setHandoffData] = React.useState(null)
-      const [handoffReload, setHandoffReload] = React.useState(0)
-      const [handoffRole, setHandoffRole] = React.useState(() => {
-        try {
-          const saved = window.localStorage.getItem(HANDOFF_ROLE_KEY)
-          return Object.hasOwn(HANDOFF_ROLES, saved) ? saved : 'product'
-        } catch (error) {
-          return 'product'
-        }
-      })
-      const [handoffDraft, setHandoffDraft] = React.useState('')
-      const [handoffUncertain, setHandoffUncertain] = React.useState(false)
-      const [commentDraft, setCommentDraft] = React.useState('')
-      const [pendingTransform, setPendingTransform] = React.useState(null)
-      const [busy, setBusy] = React.useState('')
+      const [selected, setSelected] = React.useState(null)
+      const [drafts, setDrafts] = React.useState({})
+      const inFlightWrites = React.useRef(new Set())
       const [notice, setNotice] = React.useState(null)
-      const [dispatchOpen, setDispatchOpen] = React.useState(false)
-      const [previewSrc, setPreviewSrc] = React.useState('')
+      const [lookupOpen, setLookupOpen] = React.useState(false)
+      const [lookupInput, setLookupInput] = React.useState('')
+      const [lookupBusy, setLookupBusy] = React.useState(false)
+      const lookupSequence = React.useRef(0)
       // null until the boot response supplies the configured default lookback.
       const [range, setRange] = React.useState(null)
       const [rangeQuery, setRangeQuery] = React.useState(null)
@@ -646,13 +671,30 @@ window.__ModuleLoader__.load({
       const [prefsReady, setPrefsReady] = React.useState(false)
       const [bootTick, setBootTick] = React.useState(0)
       const [listUpdatedAt, setListUpdatedAt] = React.useState(0)
-      const [dispatchPayload, setDispatchPayload] = React.useState(null)
-      const [dispatchDraft, setDispatchDraft] = React.useState('')
-      const [dispatchKind, setDispatchKind] = React.useState('bug')
 
-      const settings = boot && boot.settings ? boot.settings : null
-      const ready = Boolean(boot && boot.ready)
-      const descriptionHtml = useRichHtml(detail && detail.issue ? detail.issue.descriptionHtml : '')
+      const settings = boot?.settings
+      const ready = Boolean(boot?.ready)
+      const pageSize = settings?.pageSize || 20
+      const selectionKey = selected ? issueKey(selected) : ''
+
+      function patchIssueDraft(update) {
+        setDrafts((current) => {
+          const draft = current[selectionKey] || {}
+          return { ...current, [selectionKey]: { ...draft, ...update(draft) } }
+        })
+      }
+
+      function startIssueWrite(operation) {
+        if (inFlightWrites.current.has(selectionKey)) return false
+        inFlightWrites.current.add(selectionKey)
+        patchIssueDraft(() => ({ operation }))
+        return true
+      }
+
+      function finishIssueWrite(update = () => ({})) {
+        inFlightWrites.current.delete(selectionKey)
+        patchIssueDraft((draft) => ({ ...update(draft), operation: '' }))
+      }
 
       React.useEffect(() => {
         let cancelled = false
@@ -698,21 +740,27 @@ window.__ModuleLoader__.load({
       }, [prefsReady, projectId, selfOnly, unfinished, range, sort])
 
       React.useEffect(() => {
-        if (!previewSrc) return undefined
-        const onKeyDown = (event) => {
-          if (event.key === 'Escape') setPreviewSrc('')
+        let timer
+        function refreshDate() {
+          clearTimeout(timer)
+          const now = new Date()
+          setRange((current) => {
+            const months = presetMonths(current)
+            if (!months || current.until === fmtDate(now)) return current
+            return presetRange(months, now)
+          })
+          const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+          timer = setTimeout(refreshDate, tomorrow.getTime() - now.getTime())
         }
-        window.addEventListener('keydown', onKeyDown)
-        return () => window.removeEventListener('keydown', onKeyDown)
-      }, [previewSrc])
+        refreshDate()
+        window.addEventListener('focus', refreshDate)
+        return () => {
+          clearTimeout(timer)
+          window.removeEventListener('focus', refreshDate)
+        }
+      }, [])
 
-      function openImagePreview(event) {
-        const target = event && event.target
-        if (target && target.tagName === 'IMG') {
-          const src = target.getAttribute('src')
-          if (src) setPreviewSrc(src)
-        }
-      }
+      React.useEffect(() => () => { lookupSequence.current += 1 }, [])
 
       React.useEffect(() => {
         const timer = setTimeout(() => setQuery(keyword.trim()), 300)
@@ -738,7 +786,7 @@ window.__ModuleLoader__.load({
         apiGet('/tasks', {
           projectId,
           page,
-          size: list.size || 20,
+          size: pageSize,
           keyword: query,
           selfOnly: selfOnly ? 1 : 0,
           unfinished: unfinished ? 1 : 0,
@@ -760,190 +808,41 @@ window.__ModuleLoader__.load({
         return () => {
           cancelled = true
         }
-      }, [ready, projectId, page, query, selfOnly, unfinished, rangeQuery, sort, tick])
+      }, [ready, projectId, page, pageSize, query, selfOnly, unfinished, rangeQuery, sort, tick])
 
-      const selected = React.useMemo(
-        () => list.items.find((item) => item.issueId === selectedId) || null,
-        [list.items, selectedId],
-      )
-
-      React.useEffect(() => {
-        if (!selected || !projectId) return undefined
-        let cancelled = false
-        setDetail(null)
-        setDetailState('loading')
-        setDetailError('')
-        setComments(null)
-        setTab('detail')
-        setPendingTransform(null)
-        Promise.all([
-          apiGet('/issue', { projectId, issueId: selected.issueId }),
-          apiGet('/comments', { projectId, issueId: selected.issueId, page: 0, size: 20 }).catch((error) => ({
-            ok: false,
-            error: errorText(error),
-            items: [],
-            total: 0,
-          })),
-        ])
-          .then(([issueData, commentData]) => {
-            if (cancelled) return
-            setDetail(issueData)
-            setComments(commentData)
-            setDetailState('ready')
-          })
-          .catch((error) => {
-            if (cancelled) return
-            setDetailError(errorText(error))
-            setDetailState('error')
-          })
-        return () => {
-          cancelled = true
-        }
-      }, [selected, projectId, tick])
-
-      React.useEffect(() => {
-        if (tab !== 'handoffs' || !detail || !detail.issue || !projectId) return undefined
-        let cancelled = false
-        setHandoffData({ loading: true, items: [], totalComments: 0, scannedComments: 0, truncated: false })
-        apiGet('/handoffs', { projectId, issueId: detail.issue.issueId })
-          .then((result) => {
-            if (!cancelled) setHandoffData(result)
-          })
-          .catch((error) => {
-            if (!cancelled) setHandoffData({ ok: false, error: errorText(error), items: [] })
-          })
-        return () => {
-          cancelled = true
-        }
-      }, [tab, selectedId, projectId, tick, handoffReload])
-
-      function refreshDetail() {
-        setTick((value) => value + 1)
+      function selectRow(item) {
+        lookupSequence.current += 1
+        setLookupBusy(false)
+        setSelected(item)
       }
 
-      async function changeStatus(transform) {
-        if (!detail || !transform) return
-        setBusy('status')
-        try {
-          await apiPost('/status', {
-            projectId,
-            issueId: detail.issue.issueId,
-            transformId: transform.id,
-            objectVersionNumber: detail.issue.objectVersionNumber,
-          })
-          setNotice({ tone: 'ok', text: `状态已改为「${transform.targetStatusName}」` })
-          setPendingTransform(null)
-          refreshDetail()
-        } catch (error) {
-          setNotice({ tone: 'error', text: `改状态失败：${errorText(error)}` })
-        } finally {
-          setBusy('')
-        }
-      }
-
-      async function submitComment() {
-        const text = commentDraft.trim()
-        if (!text || !detail) return
-        setBusy('comment')
-        try {
-          await apiPost('/comment', { action: 'add', projectId, issueId: detail.issue.issueId, text })
-          setCommentDraft('')
-          setNotice({ tone: 'ok', text: '评论已发送' })
-          refreshDetail()
-        } catch (error) {
-          setNotice({ tone: 'error', text: `发评论失败：${errorText(error)}` })
-        } finally {
-          setBusy('')
-        }
-      }
-
-      async function removeComment(item) {
-        if (!detail) return
-        if (!window.confirm('删除这条评论？')) return
-        setBusy('comment')
-        try {
-          await apiPost('/comment', { action: 'delete', projectId, commentId: item.commentId })
-          setNotice({ tone: 'ok', text: '评论已删除' })
-          refreshDetail()
-        } catch (error) {
-          setNotice({ tone: 'error', text: `删除失败：${errorText(error)}` })
-        } finally {
-          setBusy('')
-        }
-      }
-
-      function chooseHandoffRole(role) {
-        if (!Object.hasOwn(HANDOFF_ROLES, role) || role === handoffRole) return
-        if (handoffUncertain) {
-          setNotice({ tone: 'warn', text: '请先核实上次交接是否已发布，再切换角色或编辑草稿。' })
+      async function lookupIssue(event) {
+        event.preventDefault()
+        const number = issueNumber(lookupInput)
+        if (!number) {
+          setNotice({ tone: 'warn', text: '请输入完整工单号或包含工单号的猪齿鱼链接。' })
           return
         }
-        if (handoffDraft.trim()) {
-          setHandoffDraft('')
-          setNotice({ tone: 'warn', text: '角色已切换，已清空上一角色的草稿；请重新生成模板。' })
-        }
-        setHandoffRole(role)
+        const sequence = ++lookupSequence.current
+        setLookupBusy(true)
         try {
-          window.localStorage.setItem(HANDOFF_ROLE_KEY, role)
-        } catch (error) {
-          /* localStorage may be unavailable */
-        }
-      }
-
-      async function prepareHandoff() {
-        if (!detail || !detail.issue || handoffUncertain) return
-        setBusy('handoff-template')
-        try {
-          const result = await apiPost('/handoff/template', {
-            projectId,
-            issueId: detail.issue.issueId,
-            role: handoffRole,
+          const { project, issue } = await apiGet('/lookup', { issueNum: number })
+          if (lookupSequence.current !== sequence) return
+          setSelected({
+            ...issue,
+            projectId: project.projectId,
+            projectName: project.name,
+            category: project.category,
+            direct: true,
           })
-          setHandoffDraft(result.text || '')
-          setNotice({ tone: 'ok', text: `${result.title || HANDOFF_ROLES[handoffRole]}模板已生成，可编辑后发布` })
+          setLookupOpen(false)
+          setLookupInput('')
+          setNotice(null)
         } catch (error) {
-          setNotice({ tone: 'error', text: `生成交接模板失败：${errorText(error)}` })
+          if (lookupSequence.current === sequence) setNotice({ tone: 'error', text: `无法打开 ${number}：${errorText(error)}` })
         } finally {
-          setBusy('')
+          if (lookupSequence.current === sequence) setLookupBusy(false)
         }
-      }
-
-      async function publishHandoff() {
-        const text = handoffDraft.trim()
-        const expectedHeader = `【阶段交接 v1｜${HANDOFF_ROLES[handoffRole]}】`
-        if (!detail || !detail.issue || !text || handoffUncertain) return
-        if (!text.startsWith(expectedHeader)) {
-          setNotice({ tone: 'error', text: `交接草稿角色与当前所选「${HANDOFF_ROLES[handoffRole]}」不匹配。请重新生成模板后再发布。` })
-          return
-        }
-        setBusy('handoff-publish')
-        setHandoffUncertain(true)
-        try {
-          const result = await apiPost('/handoff', { projectId, issueId: detail.issue.issueId, text })
-          if (result.verified) {
-            setHandoffUncertain(false)
-            setNotice({ tone: 'ok', text: result.message || '交接记录已发布并回读核实' })
-            if (result.handoff) {
-              setHandoffData((current) => ({
-                ...(current || {}),
-                ok: true,
-                items: [result.handoff, ...((current && current.items) || []).filter((item) => item.commentId !== result.handoff.commentId)],
-              }))
-            }
-          } else {
-            setNotice({ tone: 'warn', text: result.message || '发布结果尚未核实；请检查猪齿鱼后再决定是否允许重试。' })
-          }
-        } catch (error) {
-          setNotice({ tone: 'error', text: `发布结果不确定：${errorText(error)}。请先检查猪齿鱼，避免重复提交。` })
-        } finally {
-          setBusy('')
-        }
-      }
-
-      function releaseHandoffRetry() {
-        if (!window.confirm('请先在猪齿鱼确认这条交接记录没有发布。确认后才会允许再次提交。')) return
-        setHandoffUncertain(false)
-        setNotice({ tone: 'warn', text: '已解除重复提交保护；发布前请再次确认评论中没有这条交接内容。' })
       }
 
       function applyRange(next) {
@@ -955,16 +854,17 @@ window.__ModuleLoader__.load({
         writeProjectPrefs(projectId, { selfOnly, unfinished, range, sort })
         saveSelectedProject(nextProjectId)
         const saved = readProjectPrefs(nextProjectId)
+        const nextRange = saved?.range || defaultRange(settings?.defaultLookbackMonths)
         setProjectId(nextProjectId)
         setSelfOnly(saved ? saved.selfOnly : true)
         setUnfinished(saved ? saved.unfinished : true)
-        setRange((saved && saved.range) || defaultRange(settings?.defaultLookbackMonths))
+        setRange(nextRange)
+        setRangeQuery(nextRange)
         setSort(saved ? saved.sort : DEFAULT_SORT)
-        setList({ items: [], total: 0, totalPages: 1, page: 0, size: list.size || 20, filter: null })
+        setList({ items: [], total: 0, totalPages: 1, page: 0, size: pageSize, filter: null })
         setListError('')
         setListUpdatedAt(0)
-        setSelectedId('')
-        setDetail(null)
+        selectRow(null)
         setPage(0)
       }
 
@@ -1001,37 +901,6 @@ window.__ModuleLoader__.load({
         applyRange({ since: value && since > value ? value : since, until: value, preset: 'custom' })
       }
 
-      async function prepareDispatch(kind) {
-        if (!detail) return
-        setDispatchOpen(false)
-        setBusy('preview')
-        try {
-          const payload = await apiPost('/dispatch', { projectId, issueId: detail.issue.issueId, kind })
-          setDispatchPayload(payload)
-          setDispatchDraft(payload.prompt || '')
-          setDispatchKind(kind)
-        } catch (error) {
-          setNotice({ tone: 'error', text: `准备草稿失败：${errorText(error)}` })
-        } finally {
-          setBusy('')
-        }
-      }
-
-      async function confirmDispatch() {
-        if (!dispatchPayload || !detail) return
-        setBusy('dispatch')
-        try {
-          const directory = await apiPost('/dispatch/confirm', { projectId })
-          const result = await startDispatch({ ...dispatchPayload, dir: directory.dir, prompt: dispatchDraft })
-          setDispatchPayload(null)
-          setNotice({ ...result, sticky: true })
-        } catch (error) {
-          setNotice({ tone: 'error', text: `创建会话失败：${errorText(error)}` })
-        } finally {
-          setBusy('')
-        }
-      }
-
       if (bootError) {
         return h('div', { style: styles.page }, h('div', { style: styles.empty },
           h('div', { style: { color: C.error, marginBottom: 8 } }, `插件后端不可用：${bootError}`),
@@ -1053,22 +922,12 @@ window.__ModuleLoader__.load({
         )
       }
 
-      if (projects.length === 0) {
-        return h(
-          'div',
-          { style: styles.page },
-          h(
-            'div',
-            { style: styles.empty },
-            h('div', { style: { fontSize: 14, color: C.text, marginBottom: 8 } }, '还没有关注任何猪齿鱼项目'),
-            h('div', null, '打开侧栏底部的设置 →「猪齿鱼」，搜索并添加你要关注的猪齿鱼项目。'),
-          ),
-        )
-      }
-
       const project = projects.find((item) => item.projectId === projectId)
-      const filterLabel = list.filter && list.filter.label ? list.filter.label : ''
+      const filterLabel = list.filter?.label
       const showFilterHint = Boolean(selfOnly && filterLabel)
+      const filterWarnings = list.filter?.warnings || (list.filter?.warning
+        ? ['自我筛选条件可能没有生效，请检查项目的过滤字段。']
+        : [])
 
       return h(
         'div',
@@ -1107,8 +966,36 @@ window.__ModuleLoader__.load({
             onClick: () => setTick((value) => value + 1),
             title: '刷新',
           }, '刷新'),
+          h('button', {
+            type: 'button',
+            style: styles.button,
+            'aria-expanded': lookupOpen,
+            onClick: () => {
+              if (lookupOpen) {
+                lookupSequence.current += 1
+                setLookupBusy(false)
+              }
+              setLookupOpen(!lookupOpen)
+            },
+          }, '工单直达'),
         ),
         h(Notice, { notice, onDismiss: () => setNotice(null) }),
+        lookupOpen
+          ? h('form', { style: styles.filterBar, onSubmit: lookupIssue },
+              h('input', {
+                style: { ...styles.input, width: 'min(410px, 70vw)' },
+                value: lookupInput,
+                placeholder: '完整工单号或猪齿鱼链接',
+                'aria-label': '要直达的工单号或链接',
+                onChange: (event) => {
+                  lookupSequence.current += 1
+                  setLookupBusy(false)
+                  setLookupInput(event.target.value)
+                },
+              }),
+              h('button', { type: 'submit', style: styles.button, disabled: lookupBusy || !lookupInput.trim() },
+                lookupBusy ? '查找中…' : '打开工单'))
+          : null,
         dateFilterBar(list, range, {
           onPreset: changePreset,
           onSince: changeSince,
@@ -1134,12 +1021,16 @@ window.__ModuleLoader__.load({
                   h('div', { style: { marginBottom: 6 } }, list.items.length > 0 ? `刷新失败，仍显示上次结果：${listError}` : listError),
                   h('button', { type: 'button', style: styles.button, onClick: () => setTick((v) => v + 1) }, '重试'))
               : null,
-            !loading && !listError && list.filter && list.filter.warning
-              ? h('div', { style: styles.notice('warn') }, '警告：自我过滤条件没有生效（返回条数等于全量），请到设置页检查「过滤字段」。')
+            !loading && !listError && filterWarnings.length > 0
+              ? h('div', { style: styles.notice('warn'), role: 'status' },
+                  filterWarnings.map((message) => h('div', { key: message }, message)),
+                  h('button', { type: 'button', style: styles.buttonTiny, onClick: () => setTick((value) => value + 1) }, '重试筛选'))
               : null,
             !loading && !listError && list.items.length === 0
               ? h('div', { style: styles.empty },
-                  query
+                  !project
+                    ? '请在设置中添加关注项目，或用「工单直达」打开单张工单。'
+                    : query
                     ? '没有匹配的工单，换个关键词或放宽创建时间范围试试。'
                     : list.filter && list.filter.dateActive
                       ? '这个创建时间范围内没有符合条件的工单；可改成「全部时间」，或取消「只看未完成 / 只看我」。'
@@ -1155,8 +1046,10 @@ window.__ModuleLoader__.load({
                 {
                   key: item.issueId,
                   type: 'button',
-                  style: selectedId === item.issueId ? { ...styles.row, ...styles.rowActive } : styles.row,
-                  onClick: () => setSelectedId(item.issueId),
+                  style: selected?.projectId === projectId && selected.issueId === item.issueId ? { ...styles.row, ...styles.rowActive } : styles.row,
+                  onClick: () => selectRow({
+                    ...item, projectId, projectName: project?.name, category: project?.category,
+                  }),
                 },
                 h('div', { style: styles.rowTop },
                   h('span', { style: styles.num }, item.issueNum),
@@ -1172,7 +1065,22 @@ window.__ModuleLoader__.load({
               ),
             ),
           ),
-          h('div', { style: styles.detailPane }, renderDetail()),
+          h('div', { style: styles.detailPane }, selected
+            ? h(IssuePane, {
+                key: selectionKey,
+                selected,
+                settings,
+                draft: drafts[selectionKey] || {},
+                patchDraft: patchIssueDraft,
+                startWrite: startIssueWrite,
+                finishWrite: finishIssueWrite,
+                setNotice,
+                onStatusChange: () => {
+                  if (selected.projectId === projectId) setTick((value) => value + 1)
+                },
+                onClose: () => selectRow(null),
+              })
+            : h('div', { style: styles.empty }, '请选择列表中的工单，或用「工单直达」打开。')),
         ),
         h(
           'div',
@@ -1193,8 +1101,279 @@ window.__ModuleLoader__.load({
           h('div', { style: { flex: 1 } }),
           h('span', { style: { fontSize: 11 }, title: listUpdatedAt ? `列表更新于 ${new Date(listUpdatedAt).toLocaleTimeString()}` : '' },
             listUpdatedAt ? `更新于 ${new Date(listUpdatedAt).toLocaleTimeString()}` : ''),
-          h('span', { style: { fontSize: 11 } }, `每页 ${list.size || 20} 条`),
+          h('span', { style: { fontSize: 11 } }, `每页 ${listUpdatedAt ? list.size : pageSize} 条`),
         ),
+      )
+    }
+
+    function IssuePane({ selected, settings, draft, patchDraft, startWrite, finishWrite, setNotice, onStatusChange, onClose }) {
+      const { projectId, issueId, issueNum, projectName, category, direct } = selected
+      const target = { projectId, issueId }
+      const [issue, setIssue] = React.useState(null)
+      const [detailError, setDetailError] = React.useState('')
+      const [detailTick, setDetailTick] = React.useState(0)
+      const [link, setLink] = React.useState(null)
+      const [tab, setTab] = React.useState('detail')
+      const [comments, setComments] = React.useState(null)
+      const [handoffs, setHandoffs] = React.useState(null)
+      const [defaultRole] = React.useState(readHandoffRole)
+      const [statusOptions, setStatusOptions] = React.useState(null)
+      const [pendingTransform, setPendingTransform] = React.useState(null)
+      const [dispatchOpen, setDispatchOpen] = React.useState(false)
+      const [dispatchLoading, setDispatchLoading] = React.useState(false)
+      const [dispatchPayload, setDispatchPayload] = React.useState(null)
+      const [dispatchDraft, setDispatchDraft] = React.useState('')
+      const [previewSrc, setPreviewSrc] = React.useState('')
+      const mounted = React.useRef(false)
+      const commentRequest = React.useRef(0)
+      const handoffRequest = React.useRef(0)
+      const dispatchKind = dispatchPayload?.kind
+      const handoffRole = draft.handoffRole || defaultRole
+      const handoffDraft = draft.handoffDraft || ''
+      const handoffPending = draft.handoffPending
+      const commentDraft = draft.commentDraft || ''
+      const busy = draft.operation
+      const descriptionHtml = useRichHtml(issue?.descriptionHtml || '')
+
+      React.useEffect(() => {
+        mounted.current = true
+        return () => { mounted.current = false }
+      }, [])
+
+      React.useEffect(() => {
+        let current = true
+        setDetailError('')
+        apiGet('/issue', target)
+          .then((data) => { if (current) setIssue(data.issue) })
+          .catch((error) => { if (current) setDetailError(errorText(error)) })
+        return () => { current = false }
+      }, [detailTick, draft.statusRevision])
+
+      React.useEffect(() => {
+        if (settings?.detailUrlTemplate) loadLink()
+      }, [])
+
+      React.useEffect(() => {
+        if (tab === 'comments' && (!comments || comments.revision !== draft.commentRevision)) loadComments()
+        if (tab === 'handoffs' && (!handoffs || handoffs.revision !== draft.handoffRevision)) loadHandoffs()
+      }, [tab, draft.commentRevision, draft.handoffRevision])
+
+      React.useEffect(() => { setPreviewSrc('') }, [tab])
+
+      React.useEffect(() => {
+        if (!previewSrc) return undefined
+        const onKeyDown = (event) => { if (event.key === 'Escape') setPreviewSrc('') }
+        window.addEventListener('keydown', onKeyDown)
+        return () => window.removeEventListener('keydown', onKeyDown)
+      }, [previewSrc])
+
+      function openImagePreview(event) {
+        const element = event.target
+        if (element?.tagName === 'IMG') setPreviewSrc(element.getAttribute('src') || '')
+      }
+
+      function report(tone, message) {
+        if (mounted.current) setNotice({ tone, text: `${issueNum} · ${message}` })
+      }
+
+      async function loadLink() {
+        setLink({ status: 'loading' })
+        try {
+          const data = await apiGet('/issue/link', { ...target, issueNum, projectName, category })
+          if (mounted.current) setLink({ status: 'ready', url: data.consoleUrl })
+        } catch {
+          if (mounted.current) setLink({ status: 'error' })
+        }
+      }
+
+      async function loadComments(page = 0) {
+        const request = ++commentRequest.current
+        const previousItems = page > 0 ? comments?.items || [] : []
+        const revision = draft.commentRevision
+        setComments({ ...comments, status: 'loading', items: previousItems, revision })
+        try {
+          const data = await apiGet('/comments', { ...target, page, size: 20 })
+          if (!mounted.current || commentRequest.current !== request) return
+          const items = new Map([...previousItems, ...data.items].map((item) => [item.commentId, item]))
+          setComments({ ...data, status: 'ready', items: [...items.values()], revision })
+        } catch (error) {
+          if (!mounted.current || commentRequest.current !== request) return
+          setComments({ ...comments, status: 'error', error: errorText(error), items: previousItems, failedPage: page, revision })
+        }
+      }
+
+      async function loadHandoffs() {
+        const request = ++handoffRequest.current
+        const revision = draft.handoffRevision
+        setHandoffs({ status: 'loading', revision })
+        try {
+          const data = await apiGet('/handoffs', target)
+          if (mounted.current && handoffRequest.current === request) setHandoffs({ ...data, status: 'ready', revision })
+        } catch (error) {
+          if (mounted.current && handoffRequest.current === request) setHandoffs({ status: 'error', error: errorText(error), revision })
+        }
+      }
+
+      async function loadTransitions() {
+        setPendingTransform(null)
+        setStatusOptions({ status: 'loading' })
+        try {
+          const data = await apiGet('/transforms', target)
+          if (mounted.current) {
+            setStatusOptions({ ...data, status: 'ready' })
+            setIssue((current) => ({ ...current, statusName: data.statusName, statusType: data.statusType }))
+          }
+        } catch (error) {
+          if (mounted.current) setStatusOptions({ status: 'error', error: errorText(error) })
+        }
+      }
+
+      async function changeStatus(transform) {
+        if (!transform || !statusOptions || !startWrite('status')) return
+        let succeeded = false
+        try {
+          await apiPost('/status', { ...target, transformId: transform.id, objectVersionNumber: statusOptions.objectVersionNumber })
+          succeeded = true
+          onStatusChange()
+          report('ok', `状态已改为「${transform.targetStatusName}」`)
+        } catch (error) {
+          report('error', `改状态失败：${errorText(error)}`)
+        } finally {
+          if (mounted.current) {
+            setPendingTransform(null)
+            setStatusOptions(null)
+          }
+          finishWrite((current) => succeeded ? { statusRevision: (current.statusRevision || 0) + 1 } : {})
+        }
+      }
+
+      async function submitComment() {
+        const text = commentDraft.trim()
+        if (!text || !startWrite('comment')) return
+        let succeeded = false
+        try {
+          await apiPost('/comment', { ...target, action: 'add', text })
+          succeeded = true
+          report('ok', '评论已发送')
+        } catch (error) {
+          report('error', `发评论失败：${errorText(error)}`)
+        } finally {
+          finishWrite((current) => succeeded ? { commentDraft: '', commentRevision: (current.commentRevision || 0) + 1 } : {})
+        }
+      }
+
+      async function removeComment(item) {
+        if (busy || !window.confirm(`删除 ${issueNum} 的这条评论？`) || !startWrite('comment')) return
+        let succeeded = false
+        try {
+          await apiPost('/comment', { ...target, action: 'delete', commentId: item.commentId })
+          succeeded = true
+          report('ok', '评论已删除')
+        } catch (error) {
+          report('error', `删除失败：${errorText(error)}`)
+        } finally {
+          finishWrite((current) => succeeded ? { commentRevision: (current.commentRevision || 0) + 1 } : {})
+        }
+      }
+
+      function chooseHandoffRole(role) {
+        if (!Object.hasOwn(HANDOFF_ROLES, role) || role === handoffRole || busy || handoffPending) return
+        if (handoffDraft.trim() && !window.confirm(`切换 ${issueNum} 的交接角色会清空当前草稿。继续切换？`)) return
+        patchDraft(() => ({ handoffRole: role, handoffDraft: '' }))
+        saveHandoffRole(role)
+      }
+
+      async function prepareHandoffDraft() {
+        if (handoffPending || !startWrite('handoff-template')) return
+        let patch = {}
+        try {
+          const result = await apiPost('/handoff/template', { ...target, role: handoffRole })
+          patch = { handoffDraft: result.text || '', handoffRole }
+        } catch (error) {
+          report('error', `生成交接模板失败：${errorText(error)}`)
+        } finally {
+          finishWrite(() => patch)
+        }
+      }
+
+      async function submitHandoff() {
+        const text = handoffDraft.trim()
+        const header = `【阶段交接 v1｜${HANDOFF_ROLES[handoffRole]}】`
+        if (handoffPending || !text.startsWith(header) || !startWrite('handoff-publish')) return
+        let result
+        try {
+          result = await apiPost('/handoff', { ...target, text })
+          report(result.rejected ? 'error' : result.verified ? 'ok' : 'warn', result.message || '交接发布请求已返回')
+        } catch (error) {
+          report('error', `发布结果待核实：${errorText(error)}。请检查猪齿鱼评论。`)
+        } finally {
+          finishWrite((current) => {
+            if (result?.rejected) return {}
+            return {
+              handoffDraft: result?.verified ? '' : handoffDraft,
+              handoffPending: result?.verified ? null : { text, receipt: result?.receipt },
+              commentRevision: (current.commentRevision || 0) + 1,
+              handoffRevision: (current.handoffRevision || 0) + 1,
+            }
+          })
+        }
+      }
+
+      async function verifyHandoff() {
+        if (!handoffPending?.receipt || !startWrite('handoff-verify')) return
+        let verified = false
+        try {
+          const data = await apiPost('/handoff/verify', { ...target, ...handoffPending })
+          verified = data.verified
+          report(verified ? 'ok' : 'warn', data.message || '发布结果仍待核实')
+        } catch (error) {
+          report('error', `核实交接失败：${errorText(error)}`)
+        } finally {
+          finishWrite((current) => verified ? {
+            handoffDraft: '', handoffPending: null,
+            commentRevision: (current.commentRevision || 0) + 1,
+            handoffRevision: (current.handoffRevision || 0) + 1,
+          } : {})
+        }
+      }
+
+      async function prepareDispatch(kind) {
+        setDispatchOpen(false)
+        setDispatchLoading(true)
+        try {
+          const payload = await apiPost('/dispatch', { ...target, kind })
+          if (!mounted.current) return
+          setDispatchPayload({ ...payload, kind, ...target })
+          setDispatchDraft(payload.prompt || '')
+        } catch (error) {
+          report('error', `准备草稿失败：${errorText(error)}`)
+        } finally {
+          if (mounted.current) setDispatchLoading(false)
+        }
+      }
+
+      async function confirmDispatch() {
+        if (!dispatchPayload || !startWrite('dispatch')) return
+        try {
+          const directory = await apiPost('/dispatch/confirm', { projectId: dispatchPayload.projectId })
+          if (!mounted.current) return
+          const result = await startDispatch({ ...dispatchPayload, dir: directory.dir, prompt: dispatchDraft }, () => mounted.current)
+          if (result && mounted.current) {
+            setDispatchPayload(null)
+            setNotice({ ...result, sticky: true })
+          }
+        } catch (error) {
+          report('error', `创建会话失败：${errorText(error)}`)
+        } finally {
+          finishWrite()
+        }
+      }
+
+      return h(React.Fragment, null,
+        direct ? h('div', { style: { ...styles.filterBar, padding: '6px 0' } },
+          h('span', null, `直达工单 · ${projectName || issueNum}`),
+          h('button', { type: 'button', style: styles.buttonTiny, onClick: onClose }, '关闭')) : null,
+        renderDetail(),
         previewSrc
           ? h(
               'div',
@@ -1292,6 +1471,7 @@ window.__ModuleLoader__.load({
                         h('textarea', {
                           style: { ...styles.textarea, minHeight: 180, marginTop: 8, width: '100%', boxSizing: 'border-box', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', lineHeight: '18px' },
                           value: dispatchDraft,
+                          disabled: busy === 'dispatch',
                           onChange: (event) => setDispatchDraft(event.target.value),
                           'aria-label': '查看或编辑需求评审指令',
                         }),
@@ -1300,16 +1480,18 @@ window.__ModuleLoader__.load({
                   : h('textarea', {
                       style: { ...styles.textarea, flex: 1, minHeight: 240, margin: 14, width: 'auto', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', lineHeight: '18px' },
                       value: dispatchDraft,
+                      disabled: busy === 'dispatch',
                       onChange: (event) => setDispatchDraft(event.target.value),
                       'aria-label': '编辑 agent 派发指令',
                     }),
                 h('div', { style: { padding: '0 18px 12px', color: C.warn, fontSize: 11, lineHeight: '16px' } },
                   dispatchKind === 'design'
-                    ? '确认后只创建需求评审会话草稿，不会写入评论或修改描述；进入会话后按回车才开始讨论。'
-                    : '确认后会新建会话，并替换该会话当前未提交的草稿；agent 只有在你进入会话并按回车后才开始执行。'),
+                    ? '已有会话草稿会保留，可先复制本次指令。进入会话并按回车后开始需求评审。'
+                    : '已有会话草稿会保留，可先复制本次指令。进入会话并按回车后开始执行。'),
                 h('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8, padding: '12px 18px', borderTop: `1px solid ${C.border}` } },
+                  h('button', { type: 'button', style: styles.button, disabled: !dispatchDraft.trim(), onClick: () => copyText(dispatchDraft) }, '复制本次指令'),
                   h('button', { type: 'button', style: styles.button, disabled: busy === 'dispatch', onClick: () => setDispatchPayload(null) }, '取消'),
-                  h('button', { type: 'button', style: styles.buttonPrimary, disabled: busy === 'dispatch' || !dispatchDraft.trim(), onClick: confirmDispatch },
+                  h('button', { type: 'button', style: styles.buttonPrimary, disabled: Boolean(busy) || !dispatchDraft.trim(), onClick: confirmDispatch },
                     busy === 'dispatch' ? '正在创建会话…' : '确认并创建会话'),
                 ),
               ),
@@ -1318,28 +1500,25 @@ window.__ModuleLoader__.load({
       )
 
       function renderDetail() {
-        if (!selected) {
-          return h('div', { style: styles.empty }, '选中左边一条工单，在这里查看明细、改状态或发评论。')
-        }
-        if (detailState === 'loading') return h('div', { style: styles.empty }, '正在加载明细…')
-        if (detailState === 'error') {
+        if (detailError && !issue) {
           return h('div', { style: styles.empty },
             h('div', { style: { color: C.error, marginBottom: 8 } }, detailError),
-            h('button', { type: 'button', style: styles.button, onClick: refreshDetail }, '重试'))
+            h('button', { type: 'button', style: styles.button, onClick: () => setDetailTick((value) => value + 1) }, '重试'))
         }
-        if (!detail) return null
-        const issue = detail.issue
-        const transforms = Array.isArray(detail.transforms) ? detail.transforms : []
+        if (!issue) return h('div', { style: styles.empty }, '正在加载明细…')
+        const transforms = statusOptions?.transforms || []
         return h('div', null,
           h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 } },
             h('span', { style: styles.num }, issue.issueNum),
             h(StatusBadge, { name: issue.statusName, type: issue.statusType }),
             h('div', { style: { flex: 1 } }),
-            detail.consoleUrl
-              ? h('button', { type: 'button', style: styles.buttonTiny, title: '复制链接', onClick: () => copyText(detail.consoleUrl || '') }, '复制链接')
+            link?.url
+              ? h('button', { type: 'button', style: styles.buttonTiny, title: '复制链接', onClick: () => copyText(link.url) }, '复制链接')
               : null,
-            detail.consoleUrl
-              ? h('button', { type: 'button', style: styles.buttonTiny, onClick: () => window.open(detail.consoleUrl, '_blank', 'noopener') }, '控制台')
+            link?.url
+              ? h('button', { type: 'button', style: styles.buttonTiny, onClick: () => window.open(link.url, '_blank', 'noopener') }, '控制台')
+              : link?.status === 'error'
+              ? h('button', { type: 'button', style: styles.buttonTiny, onClick: loadLink }, '重试读取链接')
               : null,
           ),
           h('div', { style: { fontSize: 14, lineHeight: '20px', fontWeight: 600, marginBottom: 8 } }, issue.summary || '(无概要)'),
@@ -1351,16 +1530,34 @@ window.__ModuleLoader__.load({
 
           // status
           h('div', { style: styles.card },
-            h('span', { style: styles.label }, `变更状态（当前「${issue.statusName}」，共 ${transforms.length} 个可选项）`),
-            transforms.length === 0
-              ? h('div', { style: { fontSize: 11, color: C.sub } }, detail.transformsError || '当前状态没有可用的转换')
+            h('button', {
+              type: 'button',
+              style: styles.button,
+              disabled: Boolean(busy) || statusOptions?.status === 'loading',
+              'aria-expanded': Boolean(statusOptions),
+              onClick: () => {
+                if (statusOptions?.status === 'ready') {
+                  setPendingTransform(null)
+                  setStatusOptions(null)
+                } else loadTransitions()
+              },
+            }, statusOptions?.status === 'loading' ? '正在查询状态选项…'
+              : statusOptions?.status === 'error' ? '重试查询状态选项'
+              : statusOptions ? '收起状态选项' : '改状态'),
+            statusOptions?.error
+              ? h('div', { style: { marginTop: 6, fontSize: 11, color: C.error } }, statusOptions.error) : null,
+            statusOptions?.status !== 'ready'
+              ? null
+              : transforms.length === 0
+              ? h('div', { style: { marginTop: 6, fontSize: 11, color: C.sub } }, '当前状态没有可用的转换')
               : h('select', {
-                  style: { ...styles.input, width: '100%' },
-                  value: '',
+                  style: { ...styles.input, width: '100%', marginTop: 6 },
+                  value: pendingTransform?.id || '',
+                  disabled: Boolean(busy),
+                  'aria-label': '选择目标状态',
                   onChange: (event) => {
                     const found = transforms.find((item) => item.id === event.target.value)
                     setPendingTransform(found || null)
-                    event.target.value = ''
                   },
                 },
                   h('option', { value: '' }, '选择目标状态…'),
@@ -1373,10 +1570,10 @@ window.__ModuleLoader__.load({
                   h('button', {
                     type: 'button',
                     style: styles.buttonPrimary,
-                    disabled: busy === 'status',
+                    disabled: Boolean(busy),
                     onClick: () => changeStatus(pendingTransform),
                   }, busy === 'status' ? '提交中…' : '确认变更'),
-                  h('button', { type: 'button', style: styles.buttonTiny, onClick: () => setPendingTransform(null) }, '取消'),
+                  h('button', { type: 'button', style: styles.buttonTiny, disabled: Boolean(busy), onClick: () => setPendingTransform(null) }, '取消'),
                 )
               : null,
           ),
@@ -1386,9 +1583,9 @@ window.__ModuleLoader__.load({
             h('button', {
               type: 'button',
               style: styles.buttonPrimary,
-              disabled: busy === 'dispatch' || busy === 'preview',
+              disabled: Boolean(busy) || dispatchLoading,
               onClick: () => setDispatchOpen((value) => !value),
-            }, busy === 'dispatch' ? '正在创建会话…' : busy === 'preview' ? '正在准备草稿…' : '去处理 ▾'),
+            }, busy === 'dispatch' ? '正在创建会话…' : dispatchLoading ? '正在准备草稿…' : '去处理 ▾'),
             dispatchOpen
               ? h('div', {
                   style: {
@@ -1423,11 +1620,15 @@ window.__ModuleLoader__.load({
           ),
 
           // tabs
-          h('div', { style: { display: 'flex', gap: 6, marginBottom: 8 } },
+          h('div', { style: { display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' } },
             h('button', { type: 'button', style: tab === 'detail' ? styles.buttonPrimary : styles.button, onClick: () => setTab('detail') }, '描述'),
             h('button', { type: 'button', style: tab === 'comments' ? styles.buttonPrimary : styles.button, onClick: () => setTab('comments') },
               `评论 ${comments && comments.ok ? comments.total : ''}`.trim()),
-            h('button', { type: 'button', style: tab === 'handoffs' ? styles.buttonPrimary : styles.button, onClick: () => setTab('handoffs') }, '协作记录'),
+            h('button', {
+              type: 'button',
+              style: tab === 'handoffs' ? styles.buttonPrimary : styles.button,
+              onClick: () => setTab('handoffs'),
+            }, '协作记录'),
           ),
 
           tab === 'detail'
@@ -1458,67 +1659,18 @@ window.__ModuleLoader__.load({
         )
       }
 
-      function renderHandoffs() {
-        const data = handoffData
-        const items = data && Array.isArray(data.items) ? data.items : []
-        return h('div', null,
-          h('div', { style: { ...styles.row, alignItems: 'center', flexWrap: 'wrap', marginBottom: 8 } },
-            h('select', {
-              style: styles.input,
-              value: handoffRole,
-              disabled: handoffUncertain,
-              onChange: (event) => chooseHandoffRole(event.target.value),
-              'aria-label': '交接记录角色',
-            }, Object.entries(HANDOFF_ROLES).map(([key, label]) => h('option', { key, value: key }, label))),
-            h('button', { type: 'button', style: styles.button, disabled: busy === 'handoff-template' || handoffUncertain, onClick: prepareHandoff },
-              busy === 'handoff-template' ? '生成中…' : '生成交接模板'),
-            h('button', { type: 'button', style: styles.buttonTiny, disabled: Boolean(data && data.loading), onClick: () => setHandoffReload((value) => value + 1) }, '刷新记录'),
-          ),
-          h('div', { style: { fontSize: 11, color: C.sub, marginBottom: 10 } }, '团队共享记录保存在猪齿鱼评论中；切换角色会清空当前草稿。发布只会在点击下方按钮后发生。'),
-          data && data.loading ? h('div', { style: styles.empty }, '正在读取共享交接记录…') : null,
-          data && data.ok === false ? h('div', { style: styles.notice('error') }, `读取交接记录失败：${data.error || '未知错误'}`) : null,
-          data && data.ok && data.truncated ? h('div', { style: styles.notice('warn'), role: 'status' }, `扫描到 ${data.scannedComments}/${data.totalComments} 条评论；历史可能更长，较早的交接记录可能未读取。`) : null,
-          data && data.ok && !data.truncated ? h('div', { style: { fontSize: 11, color: C.sub, marginBottom: 8 } }, `已扫描 ${data.scannedComments} 条评论，发现 ${items.length} 条交接记录。`) : null,
-          handoffUncertain ? h('div', { style: { ...styles.notice('warn'), marginBottom: 8 }, role: 'alert' },
-            h('span', null, '上次发布结果尚未核实。先到猪齿鱼检查评论；确认没有发布后，再解除保护。'),
-            h('button', { type: 'button', style: styles.buttonTiny, onClick: releaseHandoffRetry }, '确认未发布，允许重试')) : null,
-          h('div', { style: { border: `1px solid ${C.border}`, borderRadius: 8, padding: 10, margin: '10px 0' } },
-            h('div', { style: styles.sectionTitle }, '交接草稿'),
-            h('textarea', {
-              style: { ...styles.textarea, minHeight: 220, width: '100%', boxSizing: 'border-box', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' },
-              value: handoffDraft,
-              disabled: handoffUncertain,
-              onChange: (event) => setHandoffDraft(event.target.value),
-              placeholder: '生成模板后填写交接内容；保留首行角色标记以便其他角色识别。',
-              'aria-label': '编辑交接记录草稿',
-            }),
-            h('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 6 } },
-              h('button', {
-                type: 'button',
-                style: styles.buttonPrimary,
-                disabled: busy === 'handoff-publish' || handoffUncertain || !handoffDraft.trim().startsWith(`【阶段交接 v1｜${HANDOFF_ROLES[handoffRole]}】`),
-                onClick: publishHandoff,
-              }, busy === 'handoff-publish' ? '发布并核实中…' : '发布交接记录')),
-          ),
-          h('div', { style: styles.sectionTitle }, `近期共享交接 ${items.length}`),
-          items.length === 0 && data && data.ok ? h('div', { style: { fontSize: 11, color: C.sub, padding: '8px 0' } }, '当前扫描范围内没有带角色标记的交接评论。') : null,
-          items.map((item) => h('div', { key: item.commentId, style: { ...styles.comment, marginBottom: 8 } },
-            h('div', { style: { display: 'flex', justifyContent: 'space-between', gap: 8, marginBottom: 5 } },
-              h('strong', null, item.stage || '阶段交接'),
-              h('span', { style: { fontSize: 10, color: C.sub } }, `${item.user || '未知'} · ${formatTime(item.lastUpdateDate)}`)),
-            item.truncated ? h('div', { style: { ...styles.notice('warn'), marginBottom: 5 } }, '原评论超过读取上限，以下内容不完整；请打开猪齿鱼原评论查看剩余部分。') : null,
-            h('div', { style: { fontSize: 11, lineHeight: '17px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' } }, item.text))),
-        )
-      }
-
       function renderComments() {
-        if (!comments) return h('div', { style: styles.empty }, '正在加载评论…')
-        if (comments.ok === false) return h('div', { style: styles.empty },
-          h('div', { style: { color: C.error, marginBottom: 8 } }, comments.error || '评论加载失败'),
-          h('button', { type: 'button', style: styles.button, disabled: busy === 'detail', onClick: refreshDetail }, '重试加载评论'))
-        const items = Array.isArray(comments.items) ? comments.items : []
+        const items = comments?.items || []
+        const loadingComments = !comments || comments.status === 'loading'
+        if (loadingComments && items.length === 0) return h('div', { style: styles.empty }, '正在加载评论…')
+        const hasMore = (comments.page ?? 0) + 1 < comments.totalPages
         return h('div', null,
-          items.length === 0 ? h('div', { style: { fontSize: 11, color: C.sub, padding: '8px 0' } }, '还没有评论') : null,
+          comments.status === 'error'
+            ? h('div', { style: styles.notice('error') },
+                h('div', null, comments.error || '评论加载失败'),
+                h('button', { type: 'button', style: styles.buttonTiny, onClick: () => loadComments(comments.failedPage) }, '重试加载评论'))
+            : null,
+          items.length === 0 && comments.status === 'ready' ? h('div', { style: { fontSize: 11, color: C.sub, padding: '8px 0' } }, '还没有评论') : null,
           items.map((item) =>
             h('div', { key: item.commentId, style: styles.comment },
               h('div', { style: { display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 } },
@@ -1526,26 +1678,130 @@ window.__ModuleLoader__.load({
                 h('span', { style: { fontSize: 10, color: C.sub } }, formatTime(item.lastUpdateDate)),
                 h('div', { style: { flex: 1 } }),
                 settings && item.loginName === settings.username
-                  ? h('button', { type: 'button', style: styles.buttonTiny, onClick: () => removeComment(item) }, '删除')
+                  ? h('button', { type: 'button', style: styles.buttonTiny, disabled: Boolean(busy), onClick: () => removeComment(item) }, '删除')
                   : null,
               ),
               h(CommentBody, { html: item.textHtml, text: item.text, onImageClick: openImagePreview }),
             ),
           ),
+          loadingComments
+            ? h('div', { style: { fontSize: 11, color: C.sub }, role: 'status' }, '正在加载更多评论…')
+            : hasMore && comments.status === 'ready'
+            ? h('button', {
+                type: 'button', style: styles.button,
+                onClick: () => loadComments(comments.page + 1),
+              }, '加载更多评论') : null,
           h('div', { style: { marginTop: 10 } },
             h('textarea', {
               style: styles.textarea,
               placeholder: '写评论（支持 Markdown，和猪齿鱼网页一致）',
+              'aria-label': `给 ${issueNum} 的评论草稿`,
               value: commentDraft,
-              onChange: (event) => setCommentDraft(event.target.value),
+              disabled: Boolean(busy),
+              onChange: (event) => {
+                const value = event.target.value
+                patchDraft(() => ({ commentDraft: value }))
+              },
             }),
             h('div', { style: { display: 'flex', justifyContent: 'flex-end', marginTop: 6 } },
               h('button', {
                 type: 'button',
                 style: styles.buttonPrimary,
-                disabled: busy === 'comment' || commentDraft.trim().length === 0,
+                disabled: Boolean(busy) || commentDraft.trim().length === 0,
                 onClick: submitComment,
-              }, busy === 'comment' ? '发送中…' : '发表评论'),
+              }, busy === 'comment' ? '发送中…' : `评论 ${issueNum}`),
+            ),
+          ),
+        )
+      }
+
+      function renderHandoffs() {
+        const ready = handoffs?.status === 'ready'
+        const items = handoffs?.items || []
+        return h('div', null,
+          ready ? h('div', { style: { ...styles.notice('ok'), marginBottom: 8, fontSize: 11 } },
+            `已在猪齿鱼扫描 ${handoffs.scannedComments || 0}/${handoffs.totalComments || 0} 条评论，找到 ${items.length} 条阶段交接。`,
+            h('button', { type: 'button', style: { ...styles.buttonTiny, marginLeft: 8 }, onClick: loadHandoffs }, '刷新记录'))
+            : handoffs?.status === 'error'
+            ? h('div', { style: styles.notice('error') },
+                h('div', null, `协作记录读取失败：${handoffs.error}`),
+                h('button', { type: 'button', style: styles.buttonTiny, onClick: loadHandoffs }, '重试读取'))
+            : h('div', { style: { fontSize: 11, color: C.sub, marginBottom: 8 }, role: 'status' }, '正在读取猪齿鱼协作记录…'),
+          handoffs?.truncated
+            ? h('div', { style: { ...styles.notice('warn'), marginBottom: 8 } }, handoffs.scanError
+              ? '部分评论未能读取，交接记录可能不完整。可刷新记录或打开猪齿鱼查看。'
+              : '评论历史未扫描完整，请在猪齿鱼中继续查找更早记录。')
+            : null,
+          ready && items.length === 0
+            ? h('div', { style: { fontSize: 11, color: C.sub, padding: '8px 0' } }, '扫描范围内没有带有「阶段交接 v1」标记的记录。')
+            : items.map((item) => h('div', { key: item.commentId, style: { ...styles.comment, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } },
+                h('div', { style: { display: 'flex', gap: 6, marginBottom: 5, color: C.sub, fontSize: 10 } },
+                  h('strong', { style: { color: C.text } }, item.stage || '阶段交接'),
+                  h('span', null, item.user || '未知'),
+                  h('span', null, formatTime(item.lastUpdateDate))),
+                item.truncated ? h('div', { style: { ...styles.notice('warn'), marginBottom: 5 } }, '原评论超过读取上限，以下内容不完整；请打开猪齿鱼原评论查看剩余部分。') : null,
+                h('div', { style: { fontSize: 11, lineHeight: '17px' } }, item.text))),
+          h('div', { style: { ...styles.card, marginTop: 10 } },
+            h('div', { style: { fontWeight: 650, fontSize: 12, marginBottom: 6 } }, '发布阶段交接'),
+            h('div', { style: { fontSize: 11, color: C.sub, marginBottom: 8 } }, '选择角色生成模板，补齐事实、证据和下一步。点击发布后会写入本工单评论区并尝试回读核实。'),
+            h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 } },
+              h('select', {
+                style: styles.input,
+                value: handoffRole,
+                disabled: Boolean(busy || handoffPending),
+                onChange: (event) => chooseHandoffRole(event.target.value),
+                'aria-label': '交接角色',
+              }, Object.entries(HANDOFF_ROLES).map(([key, label]) => h('option', { key, value: key }, label))),
+              h('button', {
+                type: 'button',
+                style: styles.button,
+                disabled: Boolean(busy || handoffPending),
+                onClick: () => {
+                  if (!handoffDraft.trim() || window.confirm(`重新生成会替换 ${issueNum} 的当前交接草稿。继续生成？`)) {
+                    prepareHandoffDraft()
+                  }
+                },
+              }, busy === 'handoff-template' ? '生成中…' : '生成模板'),
+            ),
+            h('textarea', {
+              style: { ...styles.textarea, minHeight: 190, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', lineHeight: '18px' },
+              placeholder: '先生成模板，再填写本阶段已核实的结果。没有依据的信息请标为待核实。',
+              value: handoffDraft,
+              disabled: Boolean(busy || handoffPending),
+              onChange: (event) => {
+                const value = event.target.value
+                patchDraft(() => ({ handoffRole, handoffDraft: value }))
+              },
+              'aria-label': '阶段交接评论草稿',
+            }),
+            handoffPending
+              ? h('div', { style: { ...styles.notice('warn'), marginTop: 7 } },
+                  `${issueNum} 的交接结果待核实。请核实本次发布后再提交。`,
+                  h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 7 } },
+                    handoffPending.receipt
+                      ? h('button', { type: 'button', style: styles.buttonTiny, disabled: Boolean(busy), onClick: verifyHandoff },
+                          busy === 'handoff-verify' ? '核实中…' : '核实本次发布') : null,
+                    h('button', {
+                      type: 'button',
+                      style: styles.buttonTiny,
+                      disabled: Boolean(busy),
+                      onClick: () => patchDraft(() => ({ handoffPending: null, handoffDraft: '' })),
+                    }, '已在猪齿鱼找到本次记录'),
+                    h('button', {
+                      type: 'button',
+                      style: styles.buttonTiny,
+                      disabled: Boolean(busy),
+                      onClick: () => patchDraft(() => ({ handoffPending: null })),
+                    }, '已确认未发布，允许重试')))
+              : null,
+            h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginTop: 7 } },
+              h('span', { style: { fontSize: 10, color: C.warn } }, '发布动作会立即以当前账号写入猪齿鱼；提交结果不明时先刷新核实，避免重复发布。'),
+              h('button', {
+                type: 'button',
+                style: styles.buttonPrimary,
+                disabled: Boolean(busy || handoffPending) || !handoffDraft.trim().startsWith(`【阶段交接 v1｜${HANDOFF_ROLES[handoffRole]}】`),
+                onClick: submitHandoff,
+              }, busy === 'handoff-publish' ? '发布并核实中…' : `发布到 ${issueNum}`),
             ),
           ),
         )
@@ -1601,8 +1857,8 @@ window.__ModuleLoader__.load({
         }, '清除筛选'),
         h('div', { style: { flex: 1 } }),
         h('span', { style: { fontSize: 11 } },
-          (filter && filter.selfOnly && filter.label ? `${filter.label} = 我 · ` : '') +
-          (filter && filter.unfinished ? '只看未完成 · ' : '') +
+          ((filter?.selfApplied ?? filter?.selfOnly) && filter?.label ? `${filter.label} = 我 · ` : '') +
+          ((filter?.unfinishedApplied ?? filter?.unfinished) ? '只看未完成 · ' : '') +
           (filter && filter.dateActive ? `创建于 ${filter.since} ~ ${filter.until} · ` : '全部时间 · ') +
           `共 ${list.total} 条`),
       )
@@ -1614,6 +1870,7 @@ window.__ModuleLoader__.load({
       const [state, setState] = React.useState(null)
       const [draft, setDraft] = React.useState(null)
       const [password, setPassword] = React.useState('')
+      const [imageHosts, setImageHosts] = React.useState('')
       const [projects, setProjects] = React.useState([])
       const [fieldOptions, setFieldOptions] = React.useState({})
       const [search, setSearch] = React.useState('')
@@ -1629,6 +1886,7 @@ window.__ModuleLoader__.load({
             if (cancelled) return
             setState(data)
             setDraft(data.settings)
+            setImageHosts((data.settings.imageHosts || []).join(', '))
             setProjects(data.settings.projects || [])
           })
           .catch((err) => {
@@ -1714,10 +1972,12 @@ window.__ModuleLoader__.load({
           const patch = { ...(draft || {}) }
           delete patch.hasPassword
           patch.projects = projects
+          patch.imageHosts = imageHosts.split(/[\s,，]+/).filter(Boolean)
           if (password) patch.password = password
           const data = await apiPost('/settings', { settings: patch })
           setState((current) => ({ ...(current || {}), settings: data.settings }))
           setDraft(data.settings)
+          setImageHosts((data.settings.imageHosts || []).join(', '))
           setPassword('')
           setNotice({ tone: 'ok', text: '设置已保存' })
         } catch (err) {
@@ -1772,6 +2032,14 @@ window.__ModuleLoader__.load({
           field('组织 ID', h('input', { style: { ...styles.input, width: 120 }, value: draft.organizationId || '', onChange: (e) => patchDraft({ organizationId: e.target.value }) })),
           field('租户 ID', h('input', { style: { ...styles.input, width: 120 }, value: draft.tenantId || '', onChange: (e) => patchDraft({ tenantId: e.target.value }) })),
         ),
+        field('额外受信图片域名', h('input', {
+          style: { ...styles.input, width: '100%' },
+          value: imageHosts,
+          placeholder: '例如 files.example.com, images.example.com',
+          onChange: (event) => setImageHosts(event.target.value),
+        })),
+        h('div', { style: { fontSize: 10, color: C.sub, marginTop: -6, marginBottom: 12 } },
+          '填写完整域名，用逗号或空格分隔。默认允许当前 HTTPS 网关和企业微信图片域名。'),
 
         h('div', { style: styles.sectionTitle }, '会话与派发'),
         field(
@@ -1795,7 +2063,7 @@ window.__ModuleLoader__.load({
         h('div', { style: { fontSize: 10, color: C.sub, marginTop: -6, marginBottom: 12 } },
           '可用占位符：{projectId} {projectName} {category} {orgId} {issueId} {issueNum}；留空则不显示控制台按钮。'),
         h('div', { style: { display: 'flex', gap: 24, alignItems: 'flex-start' } },
-          field('每页条数', h('input', { style: { ...styles.input, width: 100 }, type: 'number', value: String(draft.pageSize || 20), onChange: (e) => patchDraft({ pageSize: Number(e.target.value) || 20 }) })),
+          field('每页条数', h('input', { style: { ...styles.input, width: 100 }, type: 'number', min: 1, max: 100, step: 1, value: String(draft.pageSize || 20), onChange: (e) => patchDraft({ pageSize: Number(e.target.value) || 20 }) })),
           field(
             '默认时间范围（月）',
             h('input', {
@@ -1873,9 +2141,9 @@ window.__ModuleLoader__.load({
           : null,
 
         h('div', { style: { display: 'flex', gap: 8, marginTop: 20 } },
-          h('button', { type: 'button', style: styles.buttonPrimary, disabled: busy === 'save', onClick: save },
+          h('button', { type: 'button', style: styles.buttonPrimary, disabled: Boolean(busy), onClick: save },
             busy === 'save' ? '保存中…' : '保存设置'),
-          h('button', { type: 'button', style: styles.button, disabled: busy === 'test', onClick: test },
+          h('button', { type: 'button', style: styles.button, disabled: Boolean(busy), onClick: test, title: '使用已保存的配置重新登录' },
             busy === 'test' ? '测试中…' : '测试连接'),
           h('div', { style: { flex: 1 } }),
           h('span', { style: { fontSize: 10, color: C.sub, alignSelf: 'center' } }, state && state.settingsFile ? state.settingsFile : ''),

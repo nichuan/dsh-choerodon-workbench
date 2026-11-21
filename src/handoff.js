@@ -48,7 +48,7 @@ export const HANDOFF_ROLES = {
   },
 }
 
-const HANDOFF_HEADER = /^【阶段交接 v1｜([^】]+)】/
+const HANDOFF_HEADER = /^【阶段交接 v1｜([^】]+)】/m
 const HANDOFF_LIMIT = 5000
 
 export function buildHandoffTemplate(role, issue = {}) {
@@ -90,7 +90,7 @@ export function isHandoffComment(comment) {
 }
 
 export function normalizeHandoffText(value) {
-  return htmlToText(String(value || ''), HANDOFF_LIMIT).replace(/\s+/g, ' ').trim()
+  return htmlToText(String(value || ''), 0).replace(/\s+/g, ' ').trim()
 }
 
 export function formatHandoffsForPrompt(handoffs, { maxItems = 8, maxChars = 1800 } = {}) {

@@ -67,92 +67,116 @@ function readName(value) {
 export class ChoerodonClient {
   constructor(getSettings) {
     this.getSettings = getSettings
-    this.memo = { token: null, scope: null, fetchedAt: 0 }
-    this.loginPromise = null
-    this.cache = new Map()
+    this.authentication = null
+  }
+
+  authenticationState() {
+    const settings = this.getSettings()
+    const base = String(settings.baseUrl || '').trim().replace(/\/+$/, '')
+    const organizationId = String(settings.organizationId || '1')
+    const tenantId = String(settings.tenantId || '1')
+    const { username, password } = settings
+    const current = this.authentication
+    if (
+      current?.base === base && current.organizationId === organizationId &&
+      current.tenantId === tenantId && current.username === username && current.password === password
+    ) {
+      return current
+    }
+    this.authentication = {
+      base, organizationId, tenantId, username, password,
+      memo: null,
+      loginPromise: null,
+      cache: new Map(),
+    }
+    return this.authentication
+  }
+
+  assertAuthentication(authentication) {
+    if (this.authenticationState() !== authentication) {
+      throw new Error('猪齿鱼连接配置已变更，请刷新并核实操作结果')
+    }
+  }
+
+  resetAuthentication() {
+    this.authentication = null
   }
 
   base() {
-    return String(this.getSettings().baseUrl || '').trim().replace(/\/+$/, '')
+    return this.authenticationState().base
   }
 
   orgId() {
-    return String(this.getSettings().organizationId || '1')
+    return this.authenticationState().organizationId
   }
 
   tenantId() {
-    return String(this.getSettings().tenantId || '1')
+    return this.authenticationState().tenantId
   }
 
-  cacheGet(key) {
-    const hit = this.cache.get(key)
+  cacheGet(key, authentication = this.authenticationState()) {
+    const hit = authentication.cache.get(key)
     if (!hit) return undefined
     if (Date.now() - hit.at > CACHE_TTL_MS) {
-      this.cache.delete(key)
+      authentication.cache.delete(key)
       return undefined
     }
     return hit.value
   }
 
-  cacheSet(key, value) {
-    this.cache.set(key, { at: Date.now(), value })
+  cacheSet(key, value, authentication = this.authenticationState()) {
+    this.assertAuthentication(authentication)
+    authentication.cache.set(key, { at: Date.now(), value })
     return value
   }
 
   /** Drop every cached response (after a settings change or a 401). */
   invalidate(prefix) {
+    const { cache } = this.authenticationState()
     if (!prefix) {
-      this.cache.clear()
+      cache.clear()
       return
     }
-    for (const key of [...this.cache.keys()]) if (key.startsWith(prefix)) this.cache.delete(key)
+    for (const key of cache.keys()) if (key.startsWith(prefix)) cache.delete(key)
   }
 
-  clearToken() {
-    this.memo = { token: null, scope: null, fetchedAt: 0 }
-    this.invalidate('self')
+  clearToken(token, authentication = this.authenticationState()) {
+    if (token !== undefined && authentication.memo?.token !== token) return
+    authentication.memo = null
+    authentication.cache.delete('self')
   }
 
   /** Test seam: install a token without running the login flow. */
   useToken(token) {
-    const settings = this.getSettings()
-    this.memo = {
-      token,
-      scope: `${this.base()}|${settings.username}|${this.tenantId()}`,
-      fetchedAt: Date.now(),
-    }
+    this.authenticationState().memo = { token, fetchedAt: Date.now() }
   }
 
-  tokenScope() {
-    const settings = this.getSettings()
-    return `${this.base()}|${settings.username}|${this.tenantId()}`
-  }
-
-  async token(force = false) {
-    const scope = this.tokenScope()
-    if (!force && this.memo.token && this.memo.scope === scope && Date.now() - this.memo.fetchedAt < TOKEN_TTL_MS) {
-      return this.memo.token
+  async token(force = false, authentication = this.authenticationState()) {
+    this.assertAuthentication(authentication)
+    const { memo } = authentication
+    if (!force && memo?.token && Date.now() - memo.fetchedAt < TOKEN_TTL_MS) {
+      return memo.token
     }
-    if (!this.loginPromise) {
-      this.loginPromise = this.login()
+    if (!authentication.loginPromise) {
+      authentication.loginPromise = this.login(authentication)
         .then((token) => {
-          this.memo = { token, scope: this.tokenScope(), fetchedAt: Date.now() }
+          this.assertAuthentication(authentication)
+          authentication.memo = { token, fetchedAt: Date.now() }
           return token
         })
         .finally(() => {
-          this.loginPromise = null
+          authentication.loginPromise = null
         })
     }
-    return this.loginPromise
+    return authentication.loginPromise
   }
 
   /** Four-step Choerodon OAuth login: public key, RSA password, 302, access_token. */
-  async login() {
-    const settings = this.getSettings()
-    if (!settings.username || !settings.password) {
+  async login(authentication = this.authenticationState()) {
+    const { base, username, password } = authentication
+    if (!username || !password) {
       throw new Error('未配置猪齿鱼账号或密码，请到设置页填写')
     }
-    const base = this.base()
     const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS)
 
     const page = await fetch(`${base}/oauth/choerodon/login`, {
@@ -161,6 +185,7 @@ export class ChoerodonClient {
       signal,
     })
     const html = await page.text()
+    this.assertAuthentication(authentication)
     const match = /data-publicKey="([^"]+)"/.exec(html)
     if (!match || !match[1]) {
       const snippet = html.replace(/\s+/g, ' ').trim().slice(0, 200)
@@ -175,8 +200,8 @@ export class ChoerodonClient {
     let cookies = cookieMap(page)
 
     const body = new URLSearchParams({
-      username: settings.username,
-      password: encryptPassword(settings.password, match[1]),
+      username,
+      password: encryptPassword(password, match[1]),
     })
     const posted = await fetch(`${base}/oauth/login`, {
       method: 'POST',
@@ -191,6 +216,7 @@ export class ChoerodonClient {
       redirect: 'manual',
       signal,
     })
+    this.assertAuthentication(authentication)
     cookies = mergeCookies(cookies, cookieMap(posted))
 
     let location = posted.headers.get('location')
@@ -211,6 +237,7 @@ export class ChoerodonClient {
         redirect: 'manual',
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       })
+      this.assertAuthentication(authentication)
       cookies = mergeCookies(cookies, cookieMap(res))
       const next = res.headers.get('location')
       if (next) {
@@ -226,23 +253,25 @@ export class ChoerodonClient {
     throw new Error('登录失败：未能从重定向链拿到 access_token')
   }
 
-  async request(pathname, { method = 'GET', body, retry = true } = {}) {
-    const token = await this.token()
+  async request(pathname, { method = 'GET', body, retry = true } = {}, authentication = this.authenticationState()) {
+    const token = await this.token(false, authentication)
+    this.assertAuthentication(authentication)
     const headers = {
       accept: 'application/json',
       authorization: `bearer ${token}`,
       'h-menu-id': '0',
-      'h-tenant-id': this.tenantId(),
+      'h-tenant-id': authentication.tenantId,
       'user-agent': UA,
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
     }
-    const response = await fetch(`${this.base()}${pathname}`, {
+    const response = await fetch(`${authentication.base}${pathname}`, {
       method,
       headers,
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
     const text = await response.text()
+    this.assertAuthentication(authentication)
     let data = null
     if (text.trim()) {
       try {
@@ -252,8 +281,8 @@ export class ChoerodonClient {
       }
     }
     if (response.status === 401 && retry) {
-      this.clearToken()
-      return this.request(pathname, { method, body, retry: false })
+      this.clearToken(token, authentication)
+      return this.request(pathname, { method, body, retry: false }, authentication)
     }
     if (!response.ok) {
       const message =
@@ -276,7 +305,8 @@ export class ChoerodonClient {
   // ---------------------------------------------------------------- identity
 
   async self() {
-    const cached = this.cacheGet('self')
+    const authentication = this.authenticationState()
+    const cached = this.cacheGet('self', authentication)
     if (cached) return cached
     const data = await this.request('/iam/choerodon/v1/users/self')
     return this.cacheSet('self', {
@@ -284,7 +314,7 @@ export class ChoerodonClient {
       realName: String(data?.realName ?? ''),
       loginName: String(data?.loginName ?? ''),
       email: String(data?.email ?? ''),
-    })
+    }, authentication)
   }
 
   // ---------------------------------------------------------------- projects
@@ -295,22 +325,25 @@ export class ChoerodonClient {
   }
 
   async allProjects() {
-    const cached = this.cacheGet('projects')
+    const authentication = this.authenticationState()
+    const cached = this.cacheGet('projects', authentication)
     if (cached) return cached
     const self = await this.self()
     const data = await this.request(
-      `/cbase/choerodon/v1/organizations/${this.orgId()}/users/${enc(self.id)}/projects/paging?page=0&size=400&params=`,
+      `/cbase/choerodon/v1/organizations/${authentication.organizationId}/users/${enc(self.id)}/projects/paging?page=0&size=400&params=`,
       { method: 'POST', body: {} },
+      authentication,
     )
     const projects = listOf(data).map(normalizeProject).filter((item) => item.projectId)
-    return this.cacheSet('projects', projects)
+    return this.cacheSet('projects', projects, authentication)
   }
 
   // ---------------------------------------------------------- project config
 
   async fieldDefs(projectId) {
     const key = `fields:${projectId}`
-    const cached = this.cacheGet(key)
+    const authentication = this.authenticationState()
+    const cached = this.cacheGet(key, authentication)
     if (cached) return cached
     const data = await this.request(
       `/agile/v1/projects/${projectId}/object_scheme_field/list?organizationId=${this.orgId()}&schemeCode=agile_issue`,
@@ -325,7 +358,7 @@ export class ChoerodonClient {
         .map((item) => String(item.typeCode ?? item.code ?? ''))
         .filter(Boolean),
     }))
-    return this.cacheSet(key, fields)
+    return this.cacheSet(key, fields, authentication)
   }
 
   async memberFields(projectId) {
@@ -335,7 +368,8 @@ export class ChoerodonClient {
 
   async statuses(projectId) {
     const key = `statuses:${projectId}`
-    const cached = this.cacheGet(key)
+    const authentication = this.authenticationState()
+    const cached = this.cacheGet(key, authentication)
     if (cached) return cached
     const data = await this.request(
       `/agile/v1/projects/${projectId}/schemes/query_status_by_project_id?apply_type=agile`,
@@ -347,7 +381,7 @@ export class ChoerodonClient {
         type: String(item.type ?? ''),
       }))
       .filter((item) => item.id && item.name)
-    return this.cacheSet(key, list)
+    return this.cacheSet(key, list, authentication)
   }
 
   async unfinishedStatusIds(projectId, types) {
@@ -374,11 +408,12 @@ export class ChoerodonClient {
 
   async baselineTotal(projectId) {
     const key = `baseline:${projectId}`
-    const cached = this.cacheGet(key)
+    const authentication = this.authenticationState()
+    const cached = this.cacheGet(key, authentication)
     if (cached !== undefined) return cached
     const data = await this.workList(projectId, { treeFlag: true, withSubIssues: false }, 0, 1)
     const total = Number(data?.totalElements ?? 0)
-    return this.cacheSet(key, Number.isFinite(total) ? total : 0)
+    return this.cacheSet(key, Number.isFinite(total) ? total : 0, authentication)
   }
 
   async issueDetail(projectId, issueId) {
@@ -390,23 +425,25 @@ export class ChoerodonClient {
   async decryptIssueId(projectId, issueId) {
     if (/^\d+$/.test(String(issueId))) return String(issueId)
     const key = `decrypt:${projectId}:${issueId}`
-    const cached = this.cacheGet(key)
+    const authentication = this.authenticationState()
+    const cached = this.cacheGet(key, authentication)
     if (cached) return cached
     try {
       const data = await this.request(
         `/agile/v1/projects/${projectId}/decrypt?issueId=${enc(issueId)}`,
       )
       const text = typeof data === 'string' ? data.trim() : ''
-      if (/^\d+$/.test(text)) return this.cacheSet(key, text)
+      if (/^\d+$/.test(text)) return this.cacheSet(key, text, authentication)
       if (data && typeof data === 'object') {
         for (const field of ['issueId', 'id', 'content', 'data']) {
           const value = data[field]
           if (typeof value === 'number' || /^\d+$/.test(String(value ?? ''))) {
-            return this.cacheSet(key, String(value))
+            return this.cacheSet(key, String(value), authentication)
           }
         }
       }
     } catch {
+      this.assertAuthentication(authentication)
       // Fall back to the encrypted id; the console re-encrypts numeric ids on its own.
     }
     return String(issueId)
@@ -445,6 +482,7 @@ export class ChoerodonClient {
       text: String(item.commentText ?? ''),
       user: String(item.userRealName ?? item.userName ?? ''),
       loginName: String(item.userLoginName ?? ''),
+      creationDate: String(item.creationDate ?? ''),
       lastUpdateDate: String(item.lastUpdateDate ?? ''),
       objectVersionNumber: Number(item.objectVersionNumber ?? 0),
       replySize: Number(item.replySize ?? 0),
@@ -535,14 +573,8 @@ export function dateCondition(since, until) {
 export function keywordCondition(keyword) {
   const query = String(keyword || '').trim()
   if (!query) return null
-  const looksLikeNumber = /^[A-Za-z][A-Za-z0-9_-]*-\d+$/.test(query) || /^\d{3,}$/.test(query)
   return {
-    field: {
-      fieldCode: looksLikeNumber ? 'issueNum' : 'content',
-      predefined: true,
-      fieldType: 'input',
-      name: looksLikeNumber ? '工单号' : '概要',
-    },
+    field: { fieldCode: 'content', predefined: true, fieldType: 'input', name: '概要' },
     relationship: 'AND',
     value: { valueStr: query },
     operation: 'LIKE',

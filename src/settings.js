@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
@@ -18,6 +19,7 @@ export const DEFAULT_SETTINGS = {
   organizationId: '1',
   tenantId: '1',
   pageSize: 20,
+  imageHosts: [],
   defaultLookbackMonths: 3,
   sessionRoot: '',
   dispatchMode: 'draft',
@@ -38,15 +40,26 @@ export function maskedSettings(settings) {
   return copy
 }
 
+export function normalizePageSize(value, fallback = DEFAULT_SETTINGS.pageSize) {
+  const count = Number(value)
+  return Number.isFinite(count) && count >= 1 ? Math.min(100, Math.floor(count)) : fallback
+}
+
 function mergeSettings(base, patch) {
   const next = { ...base, ...(patch || {}) }
   for (const key of Object.keys(DEFAULT_SETTINGS)) {
     if (next[key] === undefined || next[key] === null) next[key] = DEFAULT_SETTINGS[key]
   }
-  if (!Array.isArray(next.projects)) next.projects = []
+  if (!Array.isArray(next.projects)) next.projects = DEFAULT_SETTINGS.projects
   if (!Array.isArray(next.unfinishedTypes) || next.unfinishedTypes.length === 0) {
     next.unfinishedTypes = DEFAULT_SETTINGS.unfinishedTypes
   }
+  next.pageSize = normalizePageSize(next.pageSize)
+  const hosts = Array.isArray(next.imageHosts) ? next.imageHosts : []
+  next.imageHosts = [...new Set(hosts
+    .filter((host) => typeof host === 'string')
+    .map((host) => host.trim().toLowerCase().replace(/\.$/, ''))
+    .filter((host) => host.length <= 253 && host.split('.').every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))))]
   const lookback = Number(next.defaultLookbackMonths)
   next.defaultLookbackMonths = Number.isFinite(lookback)
     ? Math.min(120, Math.max(0, Math.round(lookback)))
@@ -57,6 +70,7 @@ function mergeSettings(base, patch) {
 export function createSettingsStore() {
   let cache = null
   let loading = null
+  let pendingSave = Promise.resolve()
 
   async function read() {
     let raw
@@ -96,19 +110,30 @@ export function createSettingsStore() {
     throw new Error('设置尚未加载')
   }
 
-  async function save(patch) {
+  async function write(patch) {
     const current = await load()
     const next = mergeSettings(current, patch)
     for (const field of SECRET_FIELDS) {
       const incoming = patch && patch[field]
       if (typeof incoming !== 'string' || incoming.length === 0) next[field] = current[field] || ''
     }
-    if (next.pageSize < 1 || next.pageSize > 200) next.pageSize = 20
     await fs.mkdir(SETTINGS_DIR, { recursive: true })
-    await fs.writeFile(SETTINGS_FILE, JSON.stringify(next, null, 2), { mode: 0o600 })
-    await fs.chmod(SETTINGS_FILE, 0o600).catch(() => {})
+    const tempFile = `${SETTINGS_FILE}.${randomUUID()}.tmp`
+    try {
+      await fs.writeFile(tempFile, JSON.stringify(next, null, 2), { mode: 0o600, flag: 'wx' })
+      await fs.rename(tempFile, SETTINGS_FILE)
+    } catch (error) {
+      await fs.unlink(tempFile).catch(() => {})
+      throw error
+    }
     cache = next
     return next
+  }
+
+  function save(patch) {
+    const result = pendingSave.then(() => write(patch))
+    pendingSave = result.catch(() => {})
+    return result
   }
 
   return { load, get, save, file: SETTINGS_FILE }

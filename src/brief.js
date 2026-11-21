@@ -61,11 +61,11 @@ export function buildBrief({ issue, kind, orgId, consoleUrl, comments = [], comm
     for (const item of attachments) lines.push(`- ${item.fileName || '附件'}：${item.url}`)
   }
   lines.push('')
-  lines.push(`## 最近评论（最多 ${commentLimit} 条）`)
+  lines.push(`## 最近普通评论（最多 ${commentLimit} 条）`)
   if (commentsUnavailable) {
     lines.push('（评论读取失败，必要时通过猪齿鱼查询补全。）')
   } else if (comments.length === 0) {
-    lines.push('（暂无评论）')
+    lines.push('（读取范围内暂无普通评论）')
   } else {
     for (const item of comments.slice(0, commentLimit)) {
       const text = htmlToText(String(item.text || ''), 1200)
@@ -75,7 +75,7 @@ export function buildBrief({ issue, kind, orgId, consoleUrl, comments = [], comm
   const handoffText = formatHandoffsForPrompt(handoffs, { maxItems: 8, maxChars: 1800 })
   if (handoffText) lines.push('', handoffText)
   if (handoffsUnavailable) lines.push('', '## 共享交接记录', '（读取失败；不可据此判断没有历史交接记录。）')
-  else if (handoffsTruncated) lines.push('', '## 共享交接记录', '（历史评论超过本次扫描上限，展示的交接记录可能不完整。）')
+  else if (handoffsTruncated) lines.push('', '## 共享交接记录', '（历史评论未扫描完整，展示的交接记录可能有遗漏。）')
   lines.push('')
   lines.push(`## 处理目标：${KIND_LABELS[normalizedKind]}`)
   if (normalizedKind === 'design') {
@@ -95,12 +95,12 @@ export function buildBrief({ issue, kind, orgId, consoleUrl, comments = [], comm
   }
   lines.push('')
   lines.push('## 补充')
-  lines.push(`- 以上是创建会话时的猪齿鱼快照；描述上限 ${descriptionLimit} 字，普通评论最多 ${commentLimit} 条且每条最多 1200 字，交接记录最多扫描 300 条评论。达到上限的内容都视为不完整，继续处理前应按需复核。`)
-  if (attachments.length > 0) lines.push('- 附件只提供名称和链接，未读取附件正文；不得声称已经检查附件。')
+  lines.push(`- 以上是创建会话时的猪齿鱼快照；描述上限 ${descriptionLimit} 字，普通评论上限最近 ${commentLimit} 条且每条最多 1200 字，交接记录最多扫描 300 条评论。所有达到上限的内容都视为不完整，继续处理前应按需复核。`)
+  if (attachments.length > 0) lines.push('- 附件当前只带入名称和链接，未读取附件内容；不得声称已经检查附件。')
   if (normalizedKind === 'design') {
-    lines.push('- 不要自动修改描述或状态。只有用户明确要求发布评论且目标工单与完整正文已确定时，才调用 choerodon_add_comment 写入并回读核实；进入需求评审或要求生成草稿本身不构成评论授权。')
+    lines.push('- 不要自动修改描述或状态。只有用户明确要求发布评论且目标工单与完整正文已确定时，才使用 choerodon_add_comment 写入并回读核实；进入需求评审或要求生成草稿本身不构成评论授权。')
   } else {
-    lines.push('- 只有用户明确要求发布评论且目标工单与完整正文已确定时，才调用 choerodon_add_comment 写入并回读核实；派发处理任务本身不构成评论授权。')
+    lines.push('- 只有用户明确要求发布评论且目标工单与完整正文已确定时，才使用 choerodon_add_comment 写入并回读核实；派发处理任务本身不构成评论授权。')
   }
   lines.push(`- 组织 ID：${orgId}；工单号前缀：${issue.projectCode || '-'}`)
 

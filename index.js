@@ -1,9 +1,9 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { createSettingsStore, maskedSettings, SETTINGS_DIR } from './src/settings.js'
+import { createSettingsStore, maskedSettings, normalizePageSize } from './src/settings.js'
 import {
   ChoerodonClient,
   dateCondition,
@@ -14,8 +14,9 @@ import {
 } from './src/choerodon.js'
 import { buildBrief, DISPATCH_KINDS, KIND_LABELS } from './src/brief.js'
 import { IMAGE_PREFIX, imageProxyPath, sanitizeRichText } from './src/html.js'
+import { createImageProxy } from './src/images.js'
 import { attachmentsOf, detailUrl, htmlToText } from './src/text.js'
-import { buildHandoffTemplate, HANDOFF_ROLES, isHandoffComment, normalizeHandoffText, parseHandoffComment } from './src/handoff.js'
+import { buildHandoffTemplate, HANDOFF_ROLES, normalizeHandoffText, parseHandoffComment } from './src/handoff.js'
 
 const API = '/api/choerodon'
 
@@ -27,10 +28,18 @@ export function apply(ctx) {
   const client = new ChoerodonClient(store.get)
   const imageToken = randomUUID()
   const imagePath = (url) => imageProxyPath(url, imageToken)
+  const images = createImageProxy({ store, client, imageToken })
 
-  const routes = createRoutes({ ctx, store, client, imagePath })
+  const routes = createRoutes({ store, client, imagePath, images })
   for (const route of routes) {
-    ctx.effect(() => ctx.connection.fetch.register(route), `choerodon-workbench: ${route.path}`)
+    const { fetch, ...definition } = route
+    ctx.effect(() => ctx.connection.fetch.register({
+      ...definition,
+      fetch: (request) => guard(async () => {
+        await store.load()
+        return fetch(request)
+      }),
+    }), `choerodon-workbench: ${route.path}`)
   }
 
   // Screenshots are fetched by the browser as <img>/fetch with no Connection
@@ -42,7 +51,7 @@ export function apply(ctx) {
         web.register({
           kind: 'prefix',
           path: IMAGE_PREFIX,
-          resource: (request) => handleImageRequest(request, { store, client, imageToken }),
+          resource: (request) => images.handle(request),
         }),
       'choerodon-workbench: image route',
     )
@@ -51,33 +60,38 @@ export function apply(ctx) {
 }
 
 
-function createRoutes({ store, client, imagePath }) {
+function createRoutes({ store, client, imagePath, images }) {
+  const handoffs = createHandoffPublisher(client)
   return [
     route(`${API}/state`, () => getState(store)),
-    route(`${API}/settings`, (request) => postSettings({ store, client }, request)),
-    route(`${API}/test`, (request) => postTest({ store, client }, request)),
+    route(`${API}/settings`, (request) => postSettings({ store, client, images }, request), 'POST'),
+    route(`${API}/test`, (request) => postTest(store, request), 'POST'),
     route(`${API}/projects`, () => getProjects(store)),
     route(`${API}/projects/all`, (request) => getProjectsAll({ client }, request)),
     route(`${API}/fields`, (request) => getFields({ client }, request)),
     route(`${API}/tasks`, (request) => getTasks({ store, client }, request)),
+    route(`${API}/lookup`, (request) => getIssueLookup({ store, client }, request)),
     route(`${API}/issue`, (request) => getIssue({ store, client, imagePath }, request)),
+    route(`${API}/issue/link`, (request) => getIssueLink({ store, client }, request)),
+    route(`${API}/transforms`, (request) => getIssueTransforms({ store, client }, request)),
     route(`${API}/comments`, (request) => getComments({ client, imagePath }, request)),
     route(`${API}/handoffs`, (request) => getHandoffs({ client }, request)),
-    route(`${API}/handoff/template`, (request) => postHandoffTemplate({ store, client }, request)),
-    route(`${API}/status`, (request) => postStatus({ client }, request)),
-    route(`${API}/comment`, (request) => postComment({ client }, request)),
-    route(`${API}/handoff`, (request) => postHandoff({ client }, request)),
-    route(`${API}/dispatch`, (request) => postDispatch({ store, client }, request)),
-    route(`${API}/dispatch/confirm`, (request) => postDispatchConfirm({ store }, request)),
+    route(`${API}/handoff/template`, (request) => postHandoffTemplate({ store, client }, request), 'POST'),
+    route(`${API}/status`, (request) => postStatus({ client }, request), 'POST'),
+    route(`${API}/comment`, (request) => postComment({ client }, request), 'POST'),
+    route(`${API}/handoff`, handoffs.publish, 'POST'),
+    route(`${API}/handoff/verify`, handoffs.verify, 'POST'),
+    route(`${API}/dispatch`, (request) => postDispatch({ store, client }, request), 'POST'),
+    route(`${API}/dispatch/confirm`, (request) => postDispatchConfirm({ store, client }, request), 'POST'),
   ]
 }
 
-function route(pathname, handler) {
+function route(pathname, handler, method = 'GET') {
   return {
     path: pathname,
-    methods: ['GET', 'POST'],
+    methods: [method],
     requestBody: 'buffered',
-    fetch: (request) => guard(() => handler(request)),
+    fetch: handler,
   }
 }
 
@@ -101,12 +115,13 @@ async function guard(run) {
 }
 
 async function readBody(request) {
-  if (request.method !== 'POST') return {}
   try {
     const text = await request.text()
-    return text ? JSON.parse(text) : {}
+    const data = text ? JSON.parse(text) : {}
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error()
+    return data
   } catch {
-    return {}
+    throw new Error('请求内容必须为 JSON 对象')
   }
 }
 
@@ -139,7 +154,9 @@ function monthsBackDate(months) {
 }
 
 function validDate(value) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(`${value}T00:00:00Z`))
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  const date = new Date(`${value}T00:00:00Z`)
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value
 }
 
 // ------------------------------------------------------------------- settings
@@ -155,35 +172,47 @@ async function getState(store) {
   }
 }
 
-async function postSettings({ store, client }, request) {
+async function postSettings({ store, client, images }, request) {
   const body = await readBody(request)
   const patch = body && typeof body.settings === 'object' && body.settings ? body.settings : body
+  const previous = await store.load()
   const next = await store.save(patch || {})
-  client.invalidate()
+  if (['baseUrl', 'username', 'password', 'organizationId', 'tenantId'].some((key) => previous[key] !== next[key])) {
+    client.resetAuthentication()
+  } else {
+    client.invalidate()
+  }
+  images.clear()
   return { ok: true, settings: maskedSettings(next) }
 }
 
-async function postTest({ store, client }, request) {
+async function postTest(store, request) {
   const body = await readBody(request)
-  const settings = await store.load()
-  if (body && body.password) {
-    await store.save({ ...(body.settings || {}), password: body.password })
-    client.invalidate()
-  }
-  const current = await store.load()
-  if (!current.password) return { ok: false, error: '请先填写密码' }
-  client.invalidate()
-  const self = await client.self()
-  const stars = await client.starProjects()
-  const watched = []
-  for (const project of current.projects) {
-    try {
-      const total = await client.baselineTotal(project.projectId)
-      watched.push({ projectId: project.projectId, name: project.name, total })
-    } catch (error) {
-      watched.push({ projectId: project.projectId, name: project.name, error: error.message })
+  const saved = await store.load()
+  const current = { ...saved }
+  if (body.settings && typeof body.settings === 'object') {
+    for (const key of ['baseUrl', 'username', 'organizationId', 'tenantId', 'projects']) {
+      if (Object.hasOwn(body.settings, key)) current[key] = body.settings[key]
     }
   }
+  if (typeof body.password === 'string' && body.password) {
+    current.password = body.password
+  } else if (current.baseUrl !== saved.baseUrl || current.username !== saved.username) {
+    return { ok: false, error: '测试其他网关或账号时，请同时提供对应密码。' }
+  }
+  if (!current.password) return { ok: false, error: '请先填写密码' }
+  if (!Array.isArray(current.projects)) return { ok: false, error: '关注项目格式无效' }
+  const testClient = new ChoerodonClient(() => current)
+  const self = await testClient.self()
+  const stars = await testClient.starProjects()
+  const watched = await Promise.all(current.projects.map(async (project) => {
+    try {
+      const total = await testClient.baselineTotal(project.projectId)
+      return { projectId: project.projectId, name: project.name, total }
+    } catch (error) {
+      return { projectId: project.projectId, name: project.name, error: error.message }
+    }
+  }))
   return { ok: true, user: self, starCount: stars.length, projects: watched }
 }
 
@@ -242,26 +271,96 @@ async function getFields({ client }, request) {
 
 // --------------------------------------------------------------------- issues
 
+const ISSUE_NUMBER = /^([A-Za-z][A-Za-z0-9_-]*)-\d+$/
+const LIST_SORTS = new Set(['lastUpdateDate,desc', 'lastUpdateDate,asc', 'creationDate,desc', 'creationDate,asc'])
+
+function issueSearchTerm(keyword, project) {
+  const prefix = ISSUE_NUMBER.exec(keyword)?.[1]
+  return prefix && prefix.toLowerCase() === project.code?.toLowerCase()
+    ? project.code + keyword.slice(prefix.length)
+    : keyword
+}
+
+async function findIssueByNumber(client, project, issueNum, body, sort) {
+  const expected = issueNum.toLowerCase()
+  const [, prefix, number] = ISSUE_NUMBER.exec(issueNum)
+  const projectMatches = project.code?.toLowerCase() === prefix.toLowerCase()
+  const size = 50
+  const maxPages = 5
+  for (let page = 0; page < maxPages; page += 1) {
+    const data = await client.workList(project.projectId, body, page, size, sort)
+    const rows = Array.isArray(data?.content) ? data.content : []
+    for (const row of rows) {
+      if (!row?.issueId) continue
+      const id = String(row.issueNum ?? '')
+      if (id.toLowerCase() === expected) return row
+      if (String(row.fullIssueNum ?? '').toLowerCase() === expected) return { ...row, issueNum: row.fullIssueNum }
+      if (projectMatches && id === number) return { ...row, issueNum }
+    }
+    if (rows.length < size || page + 1 >= Number(data?.totalPages)) return null
+  }
+  throw new Error(`前 ${size * maxPages} 条搜索结果中未找到 ${issueNum}，请到猪齿鱼核对`)
+}
+
+async function getIssueLookup({ store, client }, request) {
+  const settings = await store.load()
+  const issueNum = String(paramsOf(request).get('issueNum') || '').trim()
+  const prefix = ISSUE_NUMBER.exec(issueNum)?.[1]?.toLowerCase()
+  if (!prefix || issueNum.length > 100) return { ok: false, error: '请输入完整工单号，例如 TEAM-123' }
+  const matchesPrefix = (item) => String(item.code || '').toLowerCase() === prefix
+  const project = settings.projects.find(matchesPrefix) || (await client.allProjects()).find(matchesPrefix)
+  if (!project) return { ok: false, error: `当前账号找不到工单号对应的项目：${prefix}` }
+
+  const query = issueSearchTerm(issueNum, project)
+  const body = { treeFlag: false, withSubIssues: true, conditions: [keywordCondition(query)] }
+  const row = await findIssueByNumber(client, project, query, body)
+  return row
+    ? { ok: true, project, issue: normalizeIssue(row, project) }
+    : { ok: false, error: `在「${project.name || project.code}」找不到 ${issueNum}` }
+}
+
+async function resolveMemberFilter(client, projectId, filter) {
+  if (!filter?.code) return { warning: '「只看我」未生效：当前项目未配置人员字段。' }
+  const predefined = filter.predefined || filter.code === 'assignee'
+  try {
+    const [self, fields] = await Promise.all([
+      client.self(),
+      predefined ? [] : client.fieldDefs(projectId),
+    ])
+    if (!self.id) return { warning: '「只看我」未生效：未能读取当前账号的人员 ID。' }
+    const fieldId = predefined ? undefined : fields.find((field) => field.code === filter.code)?.id
+    if (!predefined && !fieldId) return { warning: '「只看我」未生效：项目人员字段已失效，请在设置中重新选择。' }
+    return { condition: memberCondition({ ...filter, predefined, fieldId }, self.id) }
+  } catch {
+    return { warning: '「只看我」未生效：人员筛选信息读取失败，可刷新重试。' }
+  }
+}
+
+async function resolveUnfinishedFilter(client, projectId, types) {
+  try {
+    const statusIds = await client.unfinishedStatusIds(projectId, types)
+    if (statusIds.length > 0) return { condition: statusCondition(statusIds) }
+    return { warning: '「只看未完成」未生效：当前项目没有匹配的未完成状态。' }
+  } catch {
+    return { warning: '「只看未完成」未生效：状态信息读取失败，可刷新重试。' }
+  }
+}
+
 async function getTasks({ store, client }, request) {
   const settings = await store.load()
   const params = paramsOf(request)
   const projectId = String(params.get('projectId') || settings.defaultProjectId || '')
   if (!projectId) return { ok: false, error: '缺少 projectId' }
-  const page = Math.max(0, Number(params.get('page') || 0) || 0)
-  const size = Math.min(100, Math.max(1, Number(params.get('size') || settings.pageSize || 20) || 20))
   const keyword = String(params.get('keyword') || '').trim()
+  const exact = ISSUE_NUMBER.test(keyword)
+  const page = exact ? 0 : Math.max(0, Math.trunc(Number(params.get('page')) || 0))
+  const size = normalizePageSize(params.get('size'), settings.pageSize)
   const selfOnly = boolParam(params, 'selfOnly', true)
   const unfinished = boolParam(params, 'unfinished', true)
   const rawSince = String(params.get('since') || '').trim()
   const rawUntil = String(params.get('until') || '').trim()
-  const sortOptions = new Set([
-    'lastUpdateDate,desc',
-    'lastUpdateDate,asc',
-    'creationDate,desc',
-    'creationDate,asc',
-  ])
   const requestedSort = String(params.get('sort') || 'lastUpdateDate,desc')
-  const sort = sortOptions.has(requestedSort) ? requestedSort : 'lastUpdateDate,desc'
+  const sort = LIST_SORTS.has(requestedSort) ? requestedSort : 'lastUpdateDate,desc'
   const project = settings.projects.find((item) => item.projectId === projectId) || {
     projectId,
     code: '',
@@ -269,77 +368,44 @@ async function getTasks({ store, client }, request) {
     filter: null,
   }
 
-  const conditions = []
-  let filterWarning = false
-  let filterLabel = ''
-
-  if (selfOnly) {
-    const filter = project.filter
-    if (filter && filter.code) {
-      filterLabel = filter.name || filter.code
-      try {
-        const self = await client.self()
-        if (filter.predefined || filter.code === 'assignee') {
-          conditions.push(memberCondition({ ...filter, predefined: true }, self.id))
-        } else {
-          const fields = await client.fieldDefs(projectId)
-          const def = fields.find((field) => field.code === filter.code)
-          if (def && def.id) {
-            conditions.push(memberCondition({ ...filter, predefined: false, fieldId: def.id }, self.id))
-          } else {
-            filterWarning = true
-          }
-        }
-      } catch (error) {
-        filterWarning = true
-      }
-    }
-  }
-
-  if (unfinished) {
-    try {
-      const statusIds = await client.unfinishedStatusIds(projectId, settings.unfinishedTypes)
-      if (statusIds.length > 0) conditions.push(statusCondition(statusIds))
-    } catch {
-      // Ignore: an unsupported status filter should not break the list.
-    }
-  }
-
-  const keywordEntry = keywordCondition(keyword)
-  if (keywordEntry) conditions.push(keywordEntry)
+  const [member, status] = await Promise.all([
+    selfOnly ? resolveMemberFilter(client, projectId, project.filter) : {},
+    unfinished ? resolveUnfinishedFilter(client, projectId, settings.unfinishedTypes) : {},
+  ])
+  const query = issueSearchTerm(keyword, project)
+  const conditions = [member.condition, status.condition, keywordCondition(query)].filter(Boolean)
+  const warnings = [member.warning, status.warning].filter(Boolean)
 
   // Creation-date window. Both ends are optional: one missing end is filled
   // from the configured default lookback / today; both empty means "all time".
   let since = validDate(rawSince) ? rawSince : ''
   let until = validDate(rawUntil) ? rawUntil : ''
   let dateActive = false
-  if (since || until) {
+  if ((rawSince && !since) || (rawUntil && !until)) {
+    warnings.push('日期筛选未生效：请输入有效的起止日期。')
+  } else if (since || until) {
     if (!since) since = monthsBackDate(settings.defaultLookbackMonths || 3)
     if (!until) until = localToday()
     if (since <= until) {
       conditions.push(dateCondition(since, until))
       dateActive = true
     } else {
-      since = ''
-      until = ''
+      warnings.push('日期筛选未生效：开始日期不能晚于结束日期。')
     }
   }
 
   const body = { treeFlag: true, withSubIssues: false }
   if (conditions.length > 0) body.conditions = conditions
 
-  const data = await client.workList(projectId, body, page, size, sort)
+  let data
+  if (exact) {
+    const row = await findIssueByNumber(client, project, query, body, sort)
+    data = { content: row ? [row] : [], totalElements: row ? 1 : 0, totalPages: 1 }
+  } else {
+    data = await client.workList(projectId, body, page, size, sort)
+  }
   const rows = Array.isArray(data?.content) ? data.content : []
   const total = Number(data?.totalElements ?? rows.length)
-
-  if (selfOnly && !unfinished && !keyword && !dateActive && filterLabel && !filterWarning) {
-    try {
-      const baseline = await client.baselineTotal(projectId)
-      if (Number.isFinite(baseline) && baseline > 0 && total >= baseline) filterWarning = true
-    } catch {
-      // Best effort only.
-    }
-  }
 
   return {
     ok: true,
@@ -352,8 +418,11 @@ async function getTasks({ store, client }, request) {
     filter: {
       selfOnly,
       unfinished,
-      label: filterLabel,
-      warning: filterWarning,
+      selfApplied: Boolean(member.condition),
+      unfinishedApplied: Boolean(status.condition),
+      label: selfOnly ? project.filter?.name || project.filter?.code || '' : '',
+      warning: warnings.length > 0,
+      warnings,
       dateActive,
       since: dateActive ? since : '',
       until: dateActive ? until : '',
@@ -367,33 +436,8 @@ async function getIssue({ store, client, imagePath }, request) {
   const projectId = String(params.get('projectId') || '')
   const issueId = String(params.get('issueId') || '')
   if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
-  const project = settings.projects.find((item) => item.projectId === projectId) || {
-    projectId,
-    code: '',
-    name: '',
-    category: '',
-  }
+  const project = settings.projects.find((item) => item.projectId === projectId)
   const detail = await client.issueDetail(projectId, issueId)
-  let transforms = []
-  let transformsError = ''
-  try {
-    transforms = await client.transforms(projectId, {
-      statusId: detail?.statusVO?.id,
-      issueId,
-      issueTypeId: detail?.issueTypeId,
-    })
-  } catch (error) {
-    transformsError = error.message
-  }
-  const numericId = await client.decryptIssueId(projectId, issueId)
-  const consoleUrl = detailUrl(settings.detailUrlTemplate, {
-    issueId: numericId,
-    issueNum: detail?.issueNum ?? '',
-    projectId,
-    projectName: project.name || detail?.projectName || '',
-    category: project.category || '',
-    orgId: settings.organizationId,
-  })
   return {
     ok: true,
     issue: {
@@ -416,12 +460,60 @@ async function getIssue({ store, client, imagePath }, request) {
       issueTypeId: String(detail?.issueTypeId ?? ''),
       attachments: attachmentsOf(detail),
       projectId,
-      projectName: project.name || String(detail?.projectName ?? ''),
-      projectCode: project.code || '',
+      projectName: project?.name || String(detail?.projectName ?? ''),
+      projectCode: project?.code || ISSUE_NUMBER.exec(String(detail?.issueNum ?? ''))?.[1] || '',
     },
-    transforms,
-    transformsError,
-    consoleUrl,
+  }
+}
+
+async function buildConsoleUrl(settings, client, project, issueId, issueNum) {
+  if (!settings.detailUrlTemplate) return ''
+  const numericId = await client.decryptIssueId(project.projectId, issueId)
+  const url = detailUrl(settings.detailUrlTemplate, {
+    issueId: encodeURIComponent(numericId),
+    issueNum: encodeURIComponent(issueNum),
+    projectId: encodeURIComponent(project.projectId),
+    projectName: encodeURIComponent(project.name || ''),
+    category: encodeURIComponent(project.category || ''),
+    orgId: encodeURIComponent(settings.organizationId),
+  })
+  return /^https?:\/\//i.test(url) ? url : ''
+}
+
+async function getIssueLink({ store, client }, request) {
+  const settings = await store.load()
+  const params = paramsOf(request)
+  const projectId = String(params.get('projectId') || '')
+  const issueId = String(params.get('issueId') || '')
+  if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
+  const project = settings.projects.find((item) => item.projectId === projectId) || {
+    projectId,
+    name: params.get('projectName') || '',
+    category: params.get('category') || '',
+  }
+  return {
+    ok: true,
+    consoleUrl: await buildConsoleUrl(settings, client, project, issueId, params.get('issueNum') || ''),
+  }
+}
+
+async function getIssueTransforms({ store, client }, request) {
+  await store.load()
+  const params = paramsOf(request)
+  const projectId = String(params.get('projectId') || '')
+  const issueId = String(params.get('issueId') || '')
+  if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
+  const detail = await client.issueDetail(projectId, issueId)
+  const statusId = String(detail?.statusVO?.id ?? '')
+  const issueTypeId = String(detail?.issueTypeId ?? detail?.issueTypeVO?.id ?? '')
+  if (!statusId || !issueTypeId) return { ok: false, error: '工单缺少当前状态或类型，无法查询可用流转。' }
+  return {
+    ok: true,
+    transforms: await client.transforms(projectId, { statusId, issueId, issueTypeId }),
+    statusId,
+    statusName: String(detail?.statusVO?.name ?? ''),
+    statusType: String(detail?.statusVO?.type ?? ''),
+    objectVersionNumber: Number(detail?.objectVersionNumber ?? 0),
   }
 }
 
@@ -446,16 +538,29 @@ async function getComments({ client, imagePath }, request) {
 const HANDOFF_PAGE_SIZE = 50
 const HANDOFF_MAX_PAGES = 6
 
-async function readHandoffs(client, projectId, issueId) {
+async function readHandoffs(client, projectId, issueId, firstPage) {
   const items = []
+  const seen = new Set()
   let total = 0
   let scanned = 0
+  let scanError = ''
   for (let page = 0; page < HANDOFF_MAX_PAGES; page += 1) {
-    const result = await client.comments(projectId, issueId, page, HANDOFF_PAGE_SIZE)
+    let result
+    try {
+      result = page === 0 && firstPage ? firstPage : await client.comments(projectId, issueId, page, HANDOFF_PAGE_SIZE)
+    } catch (error) {
+      if (page === 0) throw error
+      scanError = error.message
+      break
+    }
     const comments = Array.isArray(result.items) ? result.items : []
     total = Number(result.total || 0)
-    scanned += comments.length
     for (const comment of comments) {
+      if (comment.commentId) {
+        if (seen.has(comment.commentId)) continue
+        seen.add(comment.commentId)
+      }
+      scanned += 1
       const handoff = parseHandoffComment(comment)
       if (handoff) items.push(handoff)
     }
@@ -465,7 +570,8 @@ async function readHandoffs(client, projectId, issueId) {
     items,
     totalComments: total,
     scannedComments: scanned,
-    truncated: scanned < total,
+    truncated: Boolean(scanError) || scanned < total,
+    scanError,
     snapshotAt: new Date().toISOString(),
   }
 }
@@ -476,205 +582,6 @@ async function getHandoffs({ client }, request) {
   const issueId = String(params.get('issueId') || '')
   if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
   return { ok: true, ...(await readHandoffs(client, projectId, issueId)) }
-}
-
-// ---------------------------------------------------------------- rich media
-
-const UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36'
-const IMAGE_TTL_MS = 30 * 60 * 1000
-const IMAGE_MAX_ENTRIES = 60
-const IMAGE_MAX_BYTES = 20 * 1024 * 1024
-const imageCache = new Map()
-
-function imageResponse(bytes, type) {
-  return new Response(bytes, {
-    status: 200,
-    headers: { 'content-type': type, 'cache-control': 'private, max-age=900' },
-  })
-}
-
-async function tryFetch(url, headers) {
-  try {
-    const response = await fetch(url, {
-      headers: { 'user-agent': UA, accept: 'image/*,*/*;q=0.8', ...headers },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(20000),
-    })
-    if (!response.ok) return null
-    return {
-      bytes: Buffer.from(await response.arrayBuffer()),
-      type: response.headers.get('content-type') || '',
-    }
-  } catch {
-    return null
-  }
-}
-
-/**
- * Fetch one screenshot. Public buckets reject an Authorization header, so the
- * token only rides along on an authenticated retry against the gateway, and a
- * private file whose embedded token expired is re-signed through hfle.
- */
-async function fetchImageBytes(target, ctx) {
-  const plain = await tryFetch(target.toString(), {})
-  if (plain) return plain
-
-  let gatewayHost = ''
-  try {
-    gatewayHost = new URL(ctx.base).hostname.toLowerCase()
-  } catch {
-    gatewayHost = ''
-  }
-  if (gatewayHost && target.hostname.toLowerCase() === gatewayHost) {
-    try {
-      const token = await ctx.client.token()
-      const authed = await tryFetch(target.toString(), {
-        authorization: `bearer ${token}`,
-        'h-tenant-id': ctx.tenantId || '1',
-        'h-menu-id': '0',
-      })
-      if (authed) return authed
-    } catch {
-      // Fall through to re-signing.
-    }
-  }
-
-  try {
-    const token = await ctx.client.token()
-    const signUrl = `${ctx.base}/hfle/v1/files/redirect-url?bucketName=private&access_token=${token}&url=${encodeURIComponent(target.toString())}`
-    const signed = await fetch(signUrl, {
-      headers: { 'user-agent': UA, 'h-tenant-id': ctx.tenantId || '1', 'h-menu-id': '0' },
-      redirect: 'manual',
-      signal: AbortSignal.timeout(20000),
-    })
-    const location = signed.headers.get('location')
-    if (location) return await tryFetch(location, {})
-  } catch {
-    // The placeholder below is the final answer.
-  }
-  return null
-}
-
-function sniffImageType(bytes, declared) {
-  if (bytes && bytes.length >= 4) {
-    if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png'
-    if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg'
-    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif'
-    if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return 'image/webp'
-    if (bytes[0] === 0x42 && bytes[1] === 0x4d) return 'image/bmp'
-  }
-  return declared && /^image\//i.test(declared) ? declared.split(';')[0] : ''
-}
-
-/** Render a small inline SVG so an expired screenshot still leaves a readable card. */
-function placeholderImage(reason) {
-  const label = reason === 'expired' ? '图片链接已失效，请在控制台查看' : '图片加载失败，请在控制台查看'
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="360" height="76"><rect x="1" y="1" width="358" height="74" rx="8" fill="none" stroke="#9aa0a6" stroke-dasharray="5 4"/><text x="180" y="44" font-family="system-ui,sans-serif" font-size="12" fill="#9aa0a6" text-anchor="middle">${label}</text></svg>`
-  return new Response(Buffer.from(svg), {
-    status: 200,
-    headers: { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'no-store' },
-  })
-}
-
-/** Refuse loopback/private targets so a ticket cannot make the Host probe itself. */
-function isPrivateHost(hostname) {
-  const host = String(hostname || '').toLowerCase()
-  if (!host) return true
-  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true
-  if (host.endsWith('.internal') || host.endsWith('.lan')) return true
-  if (host.startsWith('[') || host.includes(':')) return true
-  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
-  if (!match) return false
-  const a = Number(match[1])
-  const b = Number(match[2])
-  if (a === 0 || a === 10 || a === 127) return true
-  if (a === 169 && b === 254) return true
-  if (a === 172 && b >= 16 && b <= 31) return true
-  if (a === 192 && b === 168) return true
-  if (a === 100 && b >= 64 && b <= 127) return true
-  if (a >= 224) return true
-  return false
-}
-
-/**
- * Any public image host is allowed: ticket screenshots come from MinIO, the
- * file services and third-party CDNs that teams paste screenshots from.
- */
-function imageHostAllowed(target) {
-  if (!/^https?:$/.test(target.protocol)) return false
-  return !isPrivateHost(target.hostname)
-}
-
-/** Token-guarded plain HTTP entry for browser image requests. */
-async function handleImageRequest(request, { store, client, imageToken }) {
-  const url = new URL(request.url)
-  if (url.pathname !== `${IMAGE_PREFIX}/image`) return new Response('not found', { status: 404 })
-  const token = url.searchParams.get('t') || ''
-  if (!token || token !== imageToken) return new Response('forbidden', { status: 403 })
-  const raw = String(url.searchParams.get('url') || '').trim()
-  return serveImage({ store, client, raw })
-}
-
-/** Serve one remote screenshot with re-signing, type sniffing, caching and a placeholder fallback. */
-async function serveImage({ store, client, raw }) {
-  if (!raw) return new Response('missing url', { status: 400 })
-  let target
-  try {
-    target = new URL(raw)
-  } catch {
-    return new Response('bad url', { status: 400 })
-  }
-  if (!/^https?:$/.test(target.protocol)) return new Response('bad scheme', { status: 400 })
-
-  const now = Date.now()
-  const cached = imageCache.get(raw)
-  if (cached && now - cached.at < IMAGE_TTL_MS) return imageResponse(cached.bytes, cached.type)
-
-  const settings = await store.load()
-  if (!imageHostAllowed(target)) {
-    logImage({ target: target.href, outcome: 'host-not-allowed' })
-    return new Response('host not allowed', { status: 403 })
-  }
-
-  const fetched = await fetchImageBytes(target, {
-    client,
-    base: String(settings.baseUrl || '').replace(/\/+$/, ''),
-    tenantId: settings.tenantId,
-  })
-  if (!fetched) {
-    logImage({ target: target.href, outcome: 'fetch-failed' })
-    return placeholderImage('expired')
-  }
-  if (fetched.bytes.length > IMAGE_MAX_BYTES) {
-    logImage({ target: target.href, outcome: 'too-large', bytes: fetched.bytes.length })
-    return placeholderImage('large')
-  }
-  const type = sniffImageType(fetched.bytes, fetched.type)
-  if (!type) {
-    logImage({ target: target.href, outcome: 'not-image', type: fetched.type, bytes: fetched.bytes.length })
-    return placeholderImage('broken')
-  }
-  logImage({ target: target.href, outcome: 'ok', type, bytes: fetched.bytes.length })
-  imageCache.set(raw, { at: now, bytes: fetched.bytes, type })
-  if (imageCache.size > IMAGE_MAX_ENTRIES) {
-    const oldest = [...imageCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]
-    if (oldest) imageCache.delete(oldest[0])
-  }
-  return imageResponse(fetched.bytes, type)
-}
-
-const imageLog = []
-function logImage(entry) {
-  const line = { at: new Date().toISOString(), ...entry }
-  imageLog.push(line)
-  if (imageLog.length > 200) imageLog.shift()
-  try {
-    const file = path.join(SETTINGS_DIR, 'image.log')
-    fs.appendFile(file, JSON.stringify(line) + '\n').catch(() => {})
-  } catch {
-    // Diagnostics are best effort.
-  }
 }
 
 // ---------------------------------------------------------------- write paths
@@ -698,10 +605,12 @@ async function postComment({ client }, request) {
   const projectId = String(body?.projectId || '')
   if (!projectId) return { ok: false, error: '缺少 projectId' }
   if (action === 'add') {
+    if (!body.issueId) return { ok: false, error: '缺少 issueId' }
     const text = String(body?.text || '').trim()
     if (!text) return { ok: false, error: '评论内容不能为空' }
     await client.addComment(projectId, String(body?.issueId || ''), text)
   } else if (action === 'update') {
+    if (!body.commentId) return { ok: false, error: '缺少 commentId' }
     const text = String(body?.text || '').trim()
     if (!text) return { ok: false, error: '评论内容不能为空' }
     await client.updateComment(projectId, {
@@ -710,6 +619,7 @@ async function postComment({ client }, request) {
       text,
     })
   } else if (action === 'delete') {
+    if (!body.commentId) return { ok: false, error: '缺少 commentId' }
     await client.deleteComment(projectId, String(body?.commentId || ''))
   } else {
     return { ok: false, error: `未知操作：${action}` }
@@ -723,7 +633,7 @@ async function postHandoffTemplate({ store, client }, request) {
   const issueId = String(body?.issueId || '')
   const role = String(body?.role || '')
   if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
-  if (!HANDOFF_ROLES[role]) return { ok: false, error: '请选择有效的交接角色' }
+  if (!Object.hasOwn(HANDOFF_ROLES, role)) return { ok: false, error: '请选择有效的交接角色' }
   const [settings, detail] = await Promise.all([store.load(), client.issueDetail(projectId, issueId)])
   const project = settings.projects.find((item) => item.projectId === projectId) || {}
   const issue = {
@@ -736,48 +646,138 @@ async function postHandoffTemplate({ store, client }, request) {
   return { ok: true, role, title: HANDOFF_ROLES[role].label, text: buildHandoffTemplate(role, issue) }
 }
 
-async function postHandoff({ client }, request) {
-  const body = await readBody(request)
-  const projectId = String(body?.projectId || '')
-  const issueId = String(body?.issueId || '')
-  const text = String(body?.text || '').trim()
-  if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
-  if (!text || !isHandoffComment({ text })) return { ok: false, error: '交接内容必须以「【阶段交接 v1｜角色】」开头' }
+function handoffDigest(text) {
+  return createHash('sha256').update(normalizeHandoffText(text)).digest('hex')
+}
 
-  await client.addComment(projectId, issueId, text)
-  try {
+function createHandoffPublisher(client) {
+  const pending = new Map()
+  const active = new Set()
+  const headers = new Set(Object.values(HANDOFF_ROLES).map(({ label }) => `【阶段交接 v1｜${label}】`))
+  const receiptLifetime = 30 * 60 * 1000
+
+  async function verifyReceipt(receipt) {
+    const { projectId, issueId, commentId, knownIds, author, submittedAt, digest, authentication } = receipt
+    client.assertAuthentication(authentication)
+    if (!commentId && (!knownIds || !author)) return null
     const latest = await client.comments(projectId, issueId, 0, HANDOFF_PAGE_SIZE)
-    const wanted = normalizeHandoffText(text)
-    const match = latest.items.find((item) => normalizeHandoffText(item.text) === wanted)
-    return {
-      ok: true,
-      verified: Boolean(match),
-      handoff: match ? parseHandoffComment(match) : null,
-      message: match ? '交接记录已发布并回读核实' : '发布请求已成功返回，但暂未在最新评论中匹配到记录；请刷新查看，避免重复提交',
+    client.assertAuthentication(authentication)
+    const matches = latest.items.filter((item) => {
+      if (commentId) return item.commentId === commentId
+      const createdAt = Date.parse(item.creationDate)
+      return item.commentId && !knownIds.has(item.commentId) &&
+        item.loginName === author &&
+        createdAt >= submittedAt - 5000 && createdAt <= submittedAt + 60000 &&
+        handoffDigest(item.text) === digest
+    })
+    return matches.length === 1 ? parseHandoffComment(matches[0]) : null
+  }
+
+  async function resultFor(key, receipt) {
+    try {
+      const handoff = await verifyReceipt(receipt)
+      if (handoff) {
+        return { ok: true, verified: true, handoff, message: '交接记录已发布并回读核实' }
+      }
+    } catch {
+      // A write may already be committed even when read-back fails.
     }
-  } catch (error) {
-    return {
-      ok: true,
-      verified: false,
-      handoff: null,
-      message: `发布请求已成功返回，但回读失败：${error?.message || String(error)}。请刷新查看，避免重复提交`,
-    }
+    const message = receipt.acknowledged
+      ? '发布请求已成功返回，暂未核实新评论。请刷新核实，避免重复提交。'
+      : '发布结果暂不确定。请刷新核实，避免重复提交。'
+    return { ok: true, verified: false, handoff: null, receipt: key, message }
+  }
+
+  return {
+    async publish(request) {
+      const body = await readBody(request)
+      const projectId = String(body.projectId || '')
+      const issueId = String(body.issueId || '')
+      const text = String(body.text || '').trim()
+      if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
+      if (!headers.has(text.split(/\r?\n/, 1)[0])) {
+        return { ok: true, rejected: true, verified: false, message: '交接首行必须是有效的「【阶段交接 v1｜角色】」标记' }
+      }
+      const authentication = client.authenticationState()
+      const operation = JSON.stringify([projectId, issueId])
+      if (active.has(operation)) {
+        return { ok: true, rejected: true, verified: false, message: '该工单已有交接正在发布，请等待结果。' }
+      }
+      active.add(operation)
+      try {
+        const [before, self] = await Promise.all([
+          client.comments(projectId, issueId, 0, HANDOFF_PAGE_SIZE).catch(() => null),
+          client.self().catch(() => null),
+        ])
+        client.assertAuthentication(authentication)
+        const submittedAt = Date.now()
+        let commentId = ''
+        let acknowledged = false
+        try {
+          const created = await client.addComment(projectId, issueId, text)
+          commentId = String(created?.commentId ?? created?.id ?? '')
+          acknowledged = true
+        } catch (error) {
+          if ([400, 401, 403, 404, 409, 413, 422].includes(error.status)) {
+            return { ok: true, rejected: true, verified: false, message: `发布被拒绝：${error.message}` }
+          }
+        }
+        for (const [key, receipt] of pending) {
+          if (receipt.submittedAt + receiptLifetime <= submittedAt || receipt.authentication !== authentication) {
+            pending.delete(key)
+          }
+        }
+        if (pending.size >= 100) pending.delete(pending.keys().next().value)
+        const key = randomUUID()
+        const receipt = {
+          projectId,
+          issueId,
+          commentId,
+          submittedAt,
+          acknowledged,
+          author: self?.loginName || '',
+          knownIds: before ? new Set(before.items.map((item) => item.commentId)) : null,
+          digest: handoffDigest(text),
+          authentication,
+        }
+        pending.set(key, receipt)
+        return await resultFor(key, receipt)
+      } finally {
+        active.delete(operation)
+      }
+    },
+    async verify(request) {
+      const body = await readBody(request)
+      const key = String(body.receipt || '')
+      const receipt = pending.get(key)
+      if (!receipt || receipt.submittedAt + receiptLifetime <= Date.now() ||
+          receipt.authentication !== client.authenticationState() ||
+          receipt.projectId !== String(body.projectId || '') ||
+          receipt.issueId !== String(body.issueId || '') ||
+          receipt.digest !== handoffDigest(body.text)) {
+        return { ok: true, verified: false, message: '核实凭据已失效或与工单不符，请在猪齿鱼查看该条评论。' }
+      }
+      return resultFor(key, receipt)
+    },
   }
 }
 
-async function postDispatchConfirm({ store }, request) {
+async function postDispatchConfirm({ store, client }, request) {
   const body = await readBody(request)
   const settings = await store.load()
   const projectId = String(body?.projectId || '')
   if (!projectId) return { ok: false, error: '缺少 projectId' }
-  const directory = dispatchDirectory(settings, projectId)
+  const project = settings.projects.find((item) => item.projectId === projectId)
+    || (await client.allProjects()).find((item) => item.projectId === projectId)
+  if (!project) return { ok: false, error: '找不到派发对应的项目' }
+  const directory = dispatchDirectory(settings, project)
   await fs.mkdir(directory, { recursive: true })
   return { ok: true, dir: directory }
 }
 
-function dispatchDirectory(settings, projectId) {
-  const project = settings.projects.find((item) => item.projectId === projectId) || { projectId, code: '' }
-  const safeCode = String(project.code || projectId).replace(/[^A-Za-z0-9._-]/g, '_')
+function dispatchDirectory(settings, project) {
+  const code = String(project.code || project.projectId).replace(/[^A-Za-z0-9._-]/g, '_')
+  const safeCode = code.length > 0 && code !== '.' && code !== '..' ? code : `project-${code}`
   const sessionRoot = String(settings.sessionRoot || '').trim() || path.join(os.homedir(), 'choerodon-sessions')
   return path.join(sessionRoot, safeCode)
 }
@@ -791,22 +791,13 @@ async function postDispatch({ store, client }, request) {
   if (!projectId || !issueId) return { ok: false, error: '缺少 projectId 或 issueId' }
   if (!DISPATCH_KINDS.includes(kind)) return { ok: false, error: `未知处理类型：${kind}` }
 
-  const project = settings.projects.find((item) => item.projectId === projectId) || {
-    projectId,
-    code: '',
-    name: '',
-    category: '',
-  }
-  const detail = await client.issueDetail(projectId, issueId)
-  const numericId = await client.decryptIssueId(projectId, issueId)
-  const consoleUrl = detailUrl(settings.detailUrlTemplate, {
-    issueId: numericId,
-    issueNum: detail?.issueNum ?? '',
-    projectId,
-    projectName: project.name || detail?.projectName || '',
-    category: project.category || '',
-    orgId: settings.organizationId,
-  })
+  const [detail, commentPage, project] = await Promise.all([
+    client.issueDetail(projectId, issueId),
+    client.comments(projectId, issueId, 0, HANDOFF_PAGE_SIZE).catch(() => null),
+    settings.projects.find((item) => item.projectId === projectId)
+      || client.allProjects().then((items) => items.find((item) => item.projectId === projectId)),
+  ])
+  if (!project) return { ok: false, error: '找不到派发对应的项目' }
   const issue = {
     issueId,
     issueNum: String(detail?.issueNum ?? ''),
@@ -825,26 +816,15 @@ async function postDispatch({ store, client }, request) {
   }
   const commentLimit = kind === 'design' ? 20 : 10
   const descriptionLimit = kind === 'design' ? 8000 : 4000
-  let comments = []
-  let commentsTotal = null
-  let commentsUnavailable = false
-  try {
-    const commentPage = await client.comments(projectId, issueId, 0, commentLimit)
-    comments = Array.isArray(commentPage.items) ? commentPage.items : []
-    commentsTotal = Number.isFinite(Number(commentPage.total)) ? Number(commentPage.total) : comments.length
-  } catch {
-    commentsUnavailable = true
-  }
-  let handoffs = []
-  let handoffsTruncated = false
-  let handoffsUnavailable = false
-  try {
-    const handoffData = await readHandoffs(client, projectId, issueId)
-    handoffs = handoffData.items
-    handoffsTruncated = handoffData.truncated
-  } catch {
-    handoffsUnavailable = true
-  }
+  const comments = (commentPage?.items || []).filter((item) => !parseHandoffComment(item)).slice(0, commentLimit)
+  const [consoleUrl, handoffData] = await Promise.all([
+    buildConsoleUrl(settings, client, project, issueId, issue.issueNum),
+    commentPage ? readHandoffs(client, projectId, issueId, commentPage) : null,
+  ])
+  const handoffs = handoffData?.items || []
+  const handoffsTruncated = Boolean(handoffData?.truncated)
+  const commentsUnavailable = !commentPage
+  const handoffsUnavailable = !handoffData
   const { title, prompt } = buildBrief({
     issue,
     kind,
@@ -859,10 +839,12 @@ async function postDispatch({ store, client }, request) {
     handoffsUnavailable,
   })
 
-  const directory = dispatchDirectory(settings, projectId)
+  const directory = dispatchDirectory(settings, project)
 
   return {
     ok: true,
+    projectId,
+    issueId,
     kind,
     title,
     prompt,
@@ -873,7 +855,7 @@ async function postDispatch({ store, client }, request) {
       descriptionTruncated: htmlToText(String(detail?.description ?? ''), descriptionLimit).endsWith('…（内容已截断）'),
       descriptionLimit,
       commentsIncluded: comments.length,
-      commentsTotal,
+      commentsTotal: commentPage?.total ?? null,
       commentsUnavailable,
       commentLimit,
       commentsTruncatedCount: comments.filter((item) => htmlToText(String(item.text || ''), 1200).endsWith('…（内容已截断）')).length,
